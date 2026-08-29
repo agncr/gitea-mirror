@@ -17,7 +17,11 @@
  */
 
 import { describe, test, expect } from "bun:test";
-import { resolveOrphanVerdict, planOrphanedRepoAction } from "./repository-cleanup-service";
+import {
+  resolveOrphanVerdict,
+  planOrphanedRepoAction,
+  belongsToProvider,
+} from "./repository-cleanup-service";
 
 describe("resolveOrphanVerdict", () => {
   test("repo present in the bulk fetch is never orphaned, regardless of the direct check", () => {
@@ -80,5 +84,32 @@ describe("planOrphanedRepoAction", () => {
 
   test("delete with deleteFromGitea enabled deletes from Gitea and the local database", () => {
     expect(planOrphanedRepoAction("delete", true)).toEqual({ gitea: "delete", db: "delete" });
+  });
+});
+
+/**
+ * Regression coverage for the multi-source cleanup hazard: orphan detection
+ * compares a repository against ONE forge. If the candidate query is not
+ * scoped by provider, a GitHub cleanup run sees every GitLab repository as
+ * "missing from GitHub" — which is true by definition — and archives or
+ * deletes the lot on the first pass.
+ */
+describe("belongsToProvider", () => {
+  test("keeps a repository only for its own forge", () => {
+    expect(belongsToProvider({ provider: "github" }, "github")).toBe(true);
+    expect(belongsToProvider({ provider: "gitlab" }, "gitlab")).toBe(true);
+  });
+
+  test("rejects cross-forge rows — the archive-everything hazard", () => {
+    // A GitHub cleanup run listing GitLab rows would find every one of them
+    // "missing from GitHub", because they were never on GitHub.
+    expect(belongsToProvider({ provider: "gitlab" }, "github")).toBe(false);
+    expect(belongsToProvider({ provider: "github" }, "gitlab")).toBe(false);
+  });
+
+  test("treats rows written before GitLab support as GitHub's", () => {
+    expect(belongsToProvider({}, "github")).toBe(true);
+    expect(belongsToProvider({ provider: null }, "github")).toBe(true);
+    expect(belongsToProvider({}, "gitlab")).toBe(false);
   });
 });

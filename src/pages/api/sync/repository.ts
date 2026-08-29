@@ -56,6 +56,7 @@ export const POST: APIRoute = async ({ request, locals }) => {
       .where(
         and(
           eq(repositories.userId, userId),
+          eq(repositories.provider, "github"),
           eq(repositories.normalizedFullName, normalizedFullName)
         )
       )
@@ -114,6 +115,9 @@ export const POST: APIRoute = async ({ request, locals }) => {
       normalizedFullName,
       url: repoData.html_url,
       cloneUrl: repoData.clone_url,
+      // Manual single-repo add is GitHub-only in v1; GitLab projects are
+      // imported through the group sync path.
+      provider: "github" as const,
       owner: repoData.owner.login,
       organization:
         repoData.owner.type === "Organization" ? repoData.owner.login : null,
@@ -176,7 +180,7 @@ export const POST: APIRoute = async ({ request, locals }) => {
     await db
       .insert(repositories)
       .values(metadata)
-      .onConflictDoNothing({ target: [repositories.userId, repositories.normalizedFullName] });
+      .onConflictDoNothing({ target: [repositories.userId, repositories.provider, repositories.normalizedFullName] });
 
     createMirrorJob({
       userId,

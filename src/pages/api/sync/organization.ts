@@ -31,13 +31,16 @@ export const POST: APIRoute = async ({ request, locals }) => {
     const trimmedOrg = org.trim();
     const normalizedOrg = trimmedOrg.toLowerCase();
 
-    // Check if org already exists (case-insensitive)
+    // Check if org already exists (case-insensitive). Restricted to GitHub:
+    // this manual add path is GitHub-only, and a same-named GitLab group is a
+    // different organization that must not block it.
     const [existingOrg] = await db
       .select()
       .from(organizations)
       .where(
         and(
           eq(organizations.userId, userId),
+          eq(organizations.provider, "github"),
           eq(organizations.normalizedName, normalizedOrg)
         )
       )
@@ -166,6 +169,7 @@ export const POST: APIRoute = async ({ request, locals }) => {
         normalizedFullName: `${normalizedOwner}/${normalizedRepoName}`,
         url: repo.html_url,
         cloneUrl: repo.clone_url ?? "",
+        provider: "github" as const,
         owner: repo.owner.login,
         organization:
           repo.owner.type === "Organization" ? repo.owner.login : null,
@@ -203,7 +207,7 @@ export const POST: APIRoute = async ({ request, locals }) => {
       await db
         .insert(repositories)
         .values(batch)
-        .onConflictDoNothing({ target: [repositories.userId, repositories.normalizedFullName] });
+        .onConflictDoNothing({ target: [repositories.userId, repositories.provider, repositories.normalizedFullName] });
     }
 
     // Insert organization metadata
@@ -213,6 +217,7 @@ export const POST: APIRoute = async ({ request, locals }) => {
       configId,
       name: orgData.login,
       normalizedName: normalizedOrg,
+      provider: "github" as const,
       avatarUrl: orgData.avatar_url,
       membershipRole: role,
       isIncluded: false,

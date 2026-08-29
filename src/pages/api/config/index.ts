@@ -9,12 +9,16 @@ import {
   mapUiScheduleToDb, 
   mapUiCleanupToDb,
   mapDbScheduleToUi,
-  mapDbCleanupToUi 
+  mapDbCleanupToUi,
+  mapUiToDbGitlabConfig,
+  mapDbToUiGitlabConfig,
+  resolveGitlabConfigIntent
 } from "@/lib/utils/config-mapper";
+import { validateOutboundUrl } from "@/lib/utils/outbound-url";
 import { encrypt, decrypt } from "@/lib/utils/encryption";
 import { createDefaultConfig } from "@/lib/utils/config-defaults";
 import { requireAuthenticatedUserId } from "@/lib/auth-guards";
-import { notificationConfigSchema } from "@/lib/db/schema";
+import { notificationConfigSchema, gitlabConfigSchema } from "@/lib/db/schema";
 
 export const POST: APIRoute = async ({ request, locals }) => {
   try {
@@ -25,6 +29,9 @@ export const POST: APIRoute = async ({ request, locals }) => {
     const body = await request.json();
     const {
       githubConfig,
+      // Optional: absent or null means "keep whatever is stored", so an older
+      // client saving an unrelated section cannot wipe a GitLab source.
+      gitlabConfig,
       giteaConfig,
       scheduleConfig,
       cleanupConfig,
@@ -65,6 +72,39 @@ export const POST: APIRoute = async ({ request, locals }) => {
       validatedNotificationConfig = parsed.data;
     }
 
+    // Absent / null / present mean keep / remove / set — see the intent helper.
+    const gitlabIntent = resolveGitlabConfigIntent(gitlabConfig);
+
+    // Validated before any database work: an invalid instance URL stored here
+    // would only surface much later inside a scheduled sync, and the scheduler
+    // fetches this URL, so it gets the same SSRF check as the connection test.
+    let validatedGitlabInput: Record<string, any> | null = null;
+    if (gitlabIntent.action === "set") {
+      const parsed = gitlabConfigSchema.safeParse(gitlabIntent.value);
+      if (!parsed.success) {
+        return new Response(
+          JSON.stringify({
+            success: false,
+            message: `Invalid gitlabConfig: ${parsed.error.message}`,
+          }),
+          { status: 400, headers: { "Content-Type": "application/json" } }
+        );
+      }
+
+      const urlCheck = validateOutboundUrl(parsed.data.url);
+      if (!urlCheck.ok) {
+        return new Response(
+          JSON.stringify({
+            success: false,
+            message: `Invalid gitlabConfig URL: ${urlCheck.reason}`,
+          }),
+          { status: 400, headers: { "Content-Type": "application/json" } }
+        );
+      }
+
+      validatedGitlabInput = parsed.data;
+    }
+
     // Validate Gitea URL format and protocol
     if (giteaConfig.url) {
       try {
@@ -99,6 +139,7 @@ export const POST: APIRoute = async ({ request, locals }) => {
     // see issue #338) and to preserve tokens when the form submits them empty.
     let existingGithub: Record<string, any> | undefined;
     let existingGitea: Record<string, any> | undefined;
+    let existingGitlab: Record<string, any> | undefined;
     if (existingConfig) {
       try {
         existingGithub =
@@ -110,6 +151,11 @@ export const POST: APIRoute = async ({ request, locals }) => {
           typeof existingConfig.giteaConfig === "string"
             ? JSON.parse(existingConfig.giteaConfig)
             : existingConfig.giteaConfig;
+
+        existingGitlab =
+          typeof existingConfig.gitlabConfig === "string"
+            ? JSON.parse(existingConfig.gitlabConfig)
+            : (existingConfig.gitlabConfig ?? undefined);
       } catch (parseError) {
         console.error("Failed to parse existing config:", parseError);
       }
@@ -124,6 +170,36 @@ export const POST: APIRoute = async ({ request, locals }) => {
       { githubConfig: existingGithub, giteaConfig: existingGitea }
     );
 
+    // The stored GitLab token is already encrypted; decrypt it so the mapper's
+    // "empty token means keep the old one" rule compares like with like.
+    let existingGitlabDecrypted: Record<string, any> | undefined = existingGitlab;
+    if (existingGitlab?.token) {
+      try {
+        existingGitlabDecrypted = {
+          ...existingGitlab,
+          token: decrypt(existingGitlab.token),
+        };
+      } catch (tokenError) {
+        console.error("Failed to decrypt stored GitLab token:", tokenError);
+      }
+    }
+
+    let mappedGitlabConfig: any = null;
+    if (gitlabIntent.action === "keep") {
+      mappedGitlabConfig = existingGitlabDecrypted ?? null;
+    } else if (gitlabIntent.action === "set") {
+      // Shape and URL were already validated above; merge in the stored token
+      // so an empty field keeps the existing credential.
+      const merged = mapUiToDbGitlabConfig(
+        { ...validatedGitlabInput, ...gitlabIntent.value } as any,
+        existingGitlabDecrypted as any
+      );
+      // A whitespace-only token is not a configured source.
+      mappedGitlabConfig = merged
+        ? { ...merged, token: (merged.token ?? "").trim() }
+        : null;
+    }
+
     // Preserve tokens if fields are empty
     try {
       // Decrypt existing tokens before preserving
@@ -137,14 +213,18 @@ export const POST: APIRoute = async ({ request, locals }) => {
     } catch (tokenError) {
       console.error("Failed to preserve tokens:", tokenError);
     }
-    
+
     // Encrypt tokens before saving
     if (mappedGithubConfig.token) {
       mappedGithubConfig.token = encrypt(mappedGithubConfig.token);
     }
-    
+
     if (mappedGiteaConfig.token) {
       mappedGiteaConfig.token = encrypt(mappedGiteaConfig.token);
+    }
+
+    if (mappedGitlabConfig?.token) {
+      mappedGitlabConfig.token = encrypt(mappedGitlabConfig.token);
     }
 
     // Map schedule and cleanup configs to database schema
@@ -197,6 +277,13 @@ export const POST: APIRoute = async ({ request, locals }) => {
         cleanupConfig: processedCleanupConfig,
         updatedAt: new Date(),
       };
+      // "keep" leaves the column untouched; "remove" writes NULL so a user can
+      // actually drop a compromised connection; "set" writes the new value.
+      if (gitlabIntent.action === "remove") {
+        updateFields.gitlabConfig = null;
+      } else if (mappedGitlabConfig) {
+        updateFields.gitlabConfig = mappedGitlabConfig;
+      }
       if (processedNotificationConfig) {
         updateFields.notificationConfig = processedNotificationConfig;
       }
@@ -246,6 +333,7 @@ export const POST: APIRoute = async ({ request, locals }) => {
       name: "Default Configuration",
       isActive: true,
       githubConfig: mappedGithubConfig,
+      gitlabConfig: mappedGitlabConfig,
       giteaConfig: mappedGiteaConfig,
       include: [],
       exclude: [],
@@ -299,11 +387,12 @@ export const GET: APIRoute = async ({ request, locals }) => {
       const uiConfig = mapDbToUiConfig(defaultConfig);
       const uiScheduleConfig = mapDbScheduleToUi(defaultConfig.scheduleConfig);
       const uiCleanupConfig = mapDbCleanupToUi(defaultConfig.cleanupConfig);
-      
+
       return new Response(
         JSON.stringify({
           ...defaultConfig,
           ...uiConfig,
+          gitlabConfig: mapDbToUiGitlabConfig(defaultConfig),
           scheduleConfig: uiScheduleConfig,
           cleanupConfig: uiCleanupConfig,
         }),
@@ -327,23 +416,38 @@ export const GET: APIRoute = async ({ request, locals }) => {
         ? JSON.parse(dbConfig.giteaConfig)
         : dbConfig.giteaConfig;
       
+      const gitlabConfig = typeof dbConfig.gitlabConfig === "string"
+        ? JSON.parse(dbConfig.gitlabConfig)
+        : dbConfig.gitlabConfig;
+
       // Decrypt tokens
       if (githubConfig.token) {
         githubConfig.token = decrypt(githubConfig.token);
       }
-      
+
       if (giteaConfig.token) {
         giteaConfig.token = decrypt(giteaConfig.token);
       }
-      
+
+      if (gitlabConfig?.token) {
+        try {
+          gitlabConfig.token = decrypt(gitlabConfig.token);
+        } catch {
+          // Clear on failure so the next save can't double-encrypt.
+          gitlabConfig.token = "";
+        }
+      }
+
       // Create modified config with decrypted tokens
       const decryptedConfig = {
         ...dbConfig,
         githubConfig,
+        gitlabConfig,
         giteaConfig
       };
 
       const uiConfig = mapDbToUiConfig(decryptedConfig);
+      const uiGitlabConfig = mapDbToUiGitlabConfig(decryptedConfig);
 
       // Map schedule and cleanup configs to UI format
       const uiScheduleConfig = mapDbScheduleToUi(dbConfig.scheduleConfig);
@@ -387,6 +491,7 @@ export const GET: APIRoute = async ({ request, locals }) => {
       return new Response(JSON.stringify({
         ...dbConfig,
         ...uiConfig,
+        gitlabConfig: uiGitlabConfig,
         scheduleConfig: {
           ...uiScheduleConfig,
           lastRun: dbConfig.scheduleConfig.lastRun,

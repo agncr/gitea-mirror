@@ -4,6 +4,7 @@
  */
 
 import { mock } from "bun:test";
+import * as schema from "@/lib/db/schema";
 
 // Set NODE_ENV to test
 process.env.NODE_ENV = "test";
@@ -48,21 +49,12 @@ mock.module("@/lib/db", () => {
     })
   };
 
+  // Only `db` is stubbed. The table objects are the real Drizzle definitions,
+  // so conditions built in production code (e.g. eq(repositories.provider, ...))
+  // still carry their column metadata and stay assertable in tests.
   return {
+    ...schema,
     db: mockDb,
-    users: {},
-    events: {},
-    configs: {},
-    repositories: {},
-    mirrorJobs: {},
-    organizations: {},
-    sessions: {},
-    accounts: {},
-    verificationTokens: {},
-    oauthApplications: {},
-    oauthAccessTokens: {},
-    oauthConsent: {},
-    ssoProviders: {}
   };
 });
 
@@ -91,6 +83,21 @@ mock.module("@/lib/utils/config-encryption", () => {
     getDecryptedGiteaToken: (config: any) => {
       // Return the token as-is for tests
       return config.giteaConfig?.token || "";
+    },
+    getDecryptedGitLabToken: (config: any) => {
+      // Return the token as-is for tests
+      return config.gitlabConfig?.token || "";
+    },
+    hasGitHubSource: (config: any) => Boolean(config.githubConfig?.token?.trim()),
+    hasGitLabSource: (config: any) =>
+      Boolean(config.gitlabConfig?.token?.trim() && config.gitlabConfig?.url?.trim()),
+    configuredSourceProviders: (config: any) => {
+      const providers: string[] = [];
+      if (config.githubConfig?.token?.trim()) providers.push("github");
+      if (config.gitlabConfig?.token?.trim() && config.gitlabConfig?.url?.trim()) {
+        providers.push("gitlab");
+      }
+      return providers;
     }
   };
 });

@@ -17,13 +17,20 @@ export function decryptConfigTokens(config: Config): Config {
     }
   }
   
+  if (config.gitlabConfig) {
+    decryptedConfig.gitlabConfig = { ...config.gitlabConfig };
+    if (config.gitlabConfig.token) {
+      decryptedConfig.gitlabConfig.token = decrypt(config.gitlabConfig.token);
+    }
+  }
+
   if (config.giteaConfig) {
     decryptedConfig.giteaConfig = { ...config.giteaConfig };
     if (config.giteaConfig.token) {
       decryptedConfig.giteaConfig.token = decrypt(config.giteaConfig.token);
     }
   }
-  
+
   return decryptedConfig;
 }
 
@@ -37,6 +44,47 @@ export function getDecryptedGitHubToken(config: Config): string {
     throw new Error("GitHub token not found in config");
   }
   return decrypt(config.githubConfig.token);
+}
+
+/**
+ * Gets a decrypted GitLab token from config
+ * @param config The config object
+ * @returns Decrypted GitLab token
+ */
+export function getDecryptedGitLabToken(config: Config): string {
+  if (!config.gitlabConfig?.token) {
+    throw new Error("GitLab token not found in config");
+  }
+  return decrypt(config.gitlabConfig.token);
+}
+
+/**
+ * Whether a GitLab source is usable: a token and an instance URL are both set.
+ */
+export function hasGitLabSource(config: Config): boolean {
+  // Trimmed: a whitespace-only token is not a usable credential.
+  return Boolean(config.gitlabConfig?.token?.trim() && config.gitlabConfig?.url?.trim());
+}
+
+/**
+ * Whether a GitHub source is usable.
+ */
+export function hasGitHubSource(config: Config): boolean {
+  return Boolean(config.githubConfig?.token?.trim());
+}
+
+/**
+ * Which forges this config can actually talk to, in a stable order.
+ *
+ * Every multi-source loop (import, scheduled sync, orphan cleanup) iterates
+ * this rather than assuming GitHub, so a GitLab-only user is served and a
+ * GitHub-only user behaves exactly as before.
+ */
+export function configuredSourceProviders(config: Config): ("github" | "gitlab")[] {
+  const providers: ("github" | "gitlab")[] = [];
+  if (hasGitHubSource(config)) providers.push("github");
+  if (hasGitLabSource(config)) providers.push("gitlab");
+  return providers;
 }
 
 /**

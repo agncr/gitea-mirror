@@ -6,6 +6,7 @@ import { createSecureErrorResponse } from "@/lib/utils";
 import { requireAuth } from "@/lib/utils/auth-helpers";
 import { mirrorOverridesSchema } from "@/lib/db/schema";
 import { normalizeMirrorOverrides } from "@/lib/utils/mirror-overrides";
+import { organizationRepositoriesFilter } from "@/lib/utils/org-scope";
 
 /**
  * Partial update. Each field is optional and only written when present in the
@@ -137,11 +138,15 @@ export const DELETE: APIRoute = async (context) => {
       );
     }
 
+    // Scoped to this organization's forge. Since migration 0015 a user can have
+    // both a GitHub and a GitLab organization named "acme"; without the
+    // provider term, deleting one would take the other's repositories with it.
     await db.delete(repositories).where(
-      and(
-        eq(repositories.userId, userId),
-        eq(repositories.organization, existingOrg.name)
-      )
+      organizationRepositoriesFilter({
+        userId,
+        organizationName: existingOrg.name,
+        provider: existingOrg.provider ?? "github",
+      })
     );
 
     await db

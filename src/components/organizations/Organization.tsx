@@ -45,13 +45,14 @@ import {
   DialogHeader,
   DialogTitle,
 } from "@/components/ui/dialog";
+import { sourceProviderOf } from "@/lib/utils/source-provider-ui";
 
 export function Organization() {
   const [organizations, setOrganizations] = useState<Organization[]>([]);
   const [isLoading, setIsLoading] = useState<boolean>(true);
   const [isDialogOpen, setIsDialogOpen] = useState<boolean>(false);
   const { user } = useAuth();
-  const { isGitHubConfigured } = useConfigStatus();
+  const { isAnySourceConfigured } = useConfigStatus();
   const { navigationKey } = useNavigation();
   const { registerRefreshCallback } = useLiveRefresh();
   const { filter, setFilter } = useFilterParams({
@@ -95,7 +96,7 @@ export function Organization() {
     }
 
     // Don't fetch organizations if GitHub is not configured
-    if (!isGitHubConfigured) {
+    if (!isAnySourceConfigured) {
       if (!isLiveRefresh) {
         setIsLoading(false);
       }
@@ -135,7 +136,7 @@ export function Organization() {
         setIsLoading(false);
       }
     }
-  }, [user?.id, isGitHubConfigured]); // Only depend on user.id, not entire user object
+  }, [user?.id, isAnySourceConfigured]); // Only depend on user.id, not entire user object
 
   useEffect(() => {
     // Reset loading state when component becomes active
@@ -146,7 +147,7 @@ export function Organization() {
   // Register with global live refresh system
   useEffect(() => {
     // Only register for live refresh if GitHub is configured
-    if (!isGitHubConfigured) {
+    if (!isAnySourceConfigured) {
       return;
     }
 
@@ -155,7 +156,7 @@ export function Organization() {
     });
 
     return unregister;
-  }, [registerRefreshCallback, fetchOrganizations, isGitHubConfigured]);
+  }, [registerRefreshCallback, fetchOrganizations, isAnySourceConfigured]);
 
   const handleRefresh = async () => {
     const success = await fetchOrganizations(false);
@@ -292,8 +293,12 @@ export function Organization() {
     }
 
     if (!force) {
+      // GitHub-only, same reasoning as the repository add path: a GitLab group
+      // of the same name is a different organization.
       const alreadyExists = organizations.some(
-        (existing) => existing.name?.trim().toLowerCase() === normalizedOrg
+        (existing) =>
+          sourceProviderOf((existing as any).provider) === "github" &&
+          existing.name?.trim().toLowerCase() === normalizedOrg
       );
 
       if (alreadyExists) {

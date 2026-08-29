@@ -530,7 +530,14 @@ export async function syncGiteaRepoEnhanced({
       if (strategyNeedsDetection(backupStrategy) && !skipForcePushDetection) {
         try {
           const decryptedGithubToken = decryptedConfig.githubConfig?.token;
-          if (decryptedGithubToken) {
+          // Force-push detection compares branch SHAs through the GitHub API.
+          // There is no GitLab implementation yet, so GitLab mirrors behave as
+          // if the strategy were "disabled" rather than blocking every sync.
+          if ((repository.provider ?? "github") === "gitlab") {
+            console.log(
+              `[Sync] Force-push detection skipped for ${repository.name}: not supported for GitLab sources yet`,
+            );
+          } else if (decryptedGithubToken) {
             const fpOctokit = createGitHubClient(decryptedGithubToken);
             const detectionResult = await detectForcePush({
               giteaUrl: config.giteaConfig.url,
@@ -749,7 +756,20 @@ export async function syncGiteaRepoEnhanced({
       });
       let metadataOctokit: Octokit | null = null;
 
+      // Metadata mirroring (issues, PRs, releases, labels, milestones) is still
+      // Octokit-only, so GitLab-sourced repositories mirror code and wiki via
+      // Gitea's migration and skip these steps. Every step below already
+      // degrades gracefully on a null client, so returning null here is the
+      // whole opt-out.
+      const isGitlabSource = (repository.provider ?? "github") === "gitlab";
+      const metadataUnavailableReason = isGitlabSource
+        ? "metadata mirroring is not supported for GitLab sources yet"
+        : "Missing GitHub token";
+
       const ensureOctokit = (): Octokit | null => {
+        if (isGitlabSource) {
+          return null;
+        }
         if (metadataOctokit) {
           return metadataOctokit;
         }
@@ -803,7 +823,7 @@ export async function syncGiteaRepoEnhanced({
         const octokit = ensureOctokit();
         if (!octokit) {
           console.warn(
-            `[Sync] Skipping release mirroring for ${repository.name}: Missing GitHub token`
+            `[Sync] Skipping release mirroring for ${repository.name}: ${metadataUnavailableReason}`
           );
         } else {
           try {
@@ -836,7 +856,7 @@ export async function syncGiteaRepoEnhanced({
         const octokit = ensureOctokit();
         if (!octokit) {
           console.warn(
-            `[Sync] Skipping issue mirroring for ${repository.name}: Missing GitHub token`
+            `[Sync] Skipping issue mirroring for ${repository.name}: ${metadataUnavailableReason}`
           );
         } else {
           try {
@@ -869,7 +889,7 @@ export async function syncGiteaRepoEnhanced({
         const octokit = ensureOctokit();
         if (!octokit) {
           console.warn(
-            `[Sync] Skipping pull request mirroring for ${repository.name}: Missing GitHub token`
+            `[Sync] Skipping pull request mirroring for ${repository.name}: ${metadataUnavailableReason}`
           );
         } else {
           try {
@@ -899,7 +919,7 @@ export async function syncGiteaRepoEnhanced({
         const octokit = ensureOctokit();
         if (!octokit) {
           console.warn(
-            `[Sync] Skipping label mirroring for ${repository.name}: Missing GitHub token`
+            `[Sync] Skipping label mirroring for ${repository.name}: ${metadataUnavailableReason}`
           );
         } else {
           try {
@@ -931,7 +951,7 @@ export async function syncGiteaRepoEnhanced({
         const octokit = ensureOctokit();
         if (!octokit) {
           console.warn(
-            `[Sync] Skipping milestone mirroring for ${repository.name}: Missing GitHub token`
+            `[Sync] Skipping milestone mirroring for ${repository.name}: ${metadataUnavailableReason}`
           );
         } else {
           try {

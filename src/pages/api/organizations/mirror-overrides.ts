@@ -26,15 +26,21 @@ export const GET: APIRoute = async (context) => {
       );
     }
 
+    // Defaults to github so links from clients that predate GitLab support
+    // keep resolving to the organization they always meant.
+    const provider =
+      context.url.searchParams.get("provider") === "gitlab" ? "gitlab" : "github";
+
     // Returns null for unknown orgs, which the caller treats the same as
     // "no overrides" — the hint then falls back to the global values.
     const mirrorOverrides = await loadOrganizationMirrorOverrides({
       organizationName: name,
       userId: user!.id,
+      provider,
     });
 
     return new Response(
-      JSON.stringify({ success: true, name, mirrorOverrides }),
+      JSON.stringify({ success: true, name, provider, mirrorOverrides }),
       { status: 200, headers: { "Content-Type": "application/json" } }
     );
   } catch (error) {

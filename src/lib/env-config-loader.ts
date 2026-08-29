@@ -31,6 +31,18 @@ interface EnvConfig {
     starredLists?: string[];
     mirrorStrategy?: 'preserve' | 'single-org' | 'flat-user' | 'mixed';
   };
+  gitlab: {
+    url?: string;
+    token?: string;
+    username?: string;
+    groups?: string[];
+    includeSubgroups?: boolean;
+    includeOwnProjects?: boolean;
+    includeForks?: boolean;
+    includeArchived?: boolean;
+    privateRepositories?: boolean;
+    publicRepositories?: boolean;
+  };
   gitea: {
     url?: string;
     externalUrl?: string;
@@ -109,6 +121,13 @@ function parseEnvConfig(): EnvConfig {
   const starredLists = process.env.MIRROR_STARRED_LISTS
     ? process.env.MIRROR_STARRED_LISTS.split(',').map((list) => list.trim()).filter(Boolean)
     : undefined;
+  const gitlabGroups = process.env.GITLAB_GROUPS
+    ? process.env.GITLAB_GROUPS.split(',').map((g) => g.trim().replace(/^\/+|\/+$/g, '')).filter(Boolean)
+    : undefined;
+  // Tri-state so an unset variable falls through to the stored value or the
+  // schema default, rather than silently meaning "false".
+  const triState = (value?: string) =>
+    value === 'true' ? true : value === 'false' ? false : undefined;
 
   return {
     github: {
@@ -136,6 +155,18 @@ function parseEnvConfig(): EnvConfig {
       starredDuplicateStrategy: process.env.STARRED_DUPLICATE_STRATEGY as 'suffix' | 'prefix' | 'owner-org',
       starredLists,
       mirrorStrategy: process.env.MIRROR_STRATEGY as 'preserve' | 'single-org' | 'flat-user' | 'mixed',
+    },
+    gitlab: {
+      url: process.env.GITLAB_URL,
+      token: process.env.GITLAB_TOKEN,
+      username: process.env.GITLAB_USERNAME,
+      groups: gitlabGroups,
+      includeSubgroups: triState(process.env.GITLAB_INCLUDE_SUBGROUPS),
+      includeOwnProjects: triState(process.env.GITLAB_INCLUDE_OWN_PROJECTS),
+      includeForks: triState(process.env.GITLAB_INCLUDE_FORKS),
+      includeArchived: triState(process.env.GITLAB_INCLUDE_ARCHIVED),
+      privateRepositories: triState(process.env.GITLAB_PRIVATE_REPOSITORIES),
+      publicRepositories: triState(process.env.GITLAB_PUBLIC_REPOSITORIES),
     },
     gitea: {
       url: process.env.GITEA_URL,
@@ -214,6 +245,7 @@ function hasEnvConfig(envConfig: EnvConfig): boolean {
   return !!(
     envConfig.github.username ||
     envConfig.github.token ||
+    envConfig.gitlab.token ||
     envConfig.gitea.url ||
     envConfig.gitea.username ||
     envConfig.gitea.token
@@ -298,6 +330,35 @@ export async function initializeConfigFromEnv(): Promise<void> {
       // ONLY_MIRROR_ORGS=true maps to skipPersonalRepos: true
       skipPersonalRepos: envConfig.github.onlyMirrorOrgs ?? existingConfig?.[0]?.githubConfig?.skipPersonalRepos ?? false,
     };
+
+    // Build GitLab config. Stays null unless GITLAB_TOKEN is set or a GitLab
+    // source is already stored, so a GitHub-only deployment never gains an
+    // empty GitLab source on restart.
+    const storedGitlab = existingConfig?.[0]?.gitlabConfig ?? undefined;
+    const gitlabConfig =
+      envConfig.gitlab.token || storedGitlab
+        ? {
+            url: envConfig.gitlab.url || storedGitlab?.url || 'https://gitlab.com',
+            token: envConfig.gitlab.token
+              ? encrypt(envConfig.gitlab.token)
+              : storedGitlab?.token || '',
+            username: envConfig.gitlab.username || storedGitlab?.username,
+            // Falls back to the stored list so a UI-managed allowlist is not
+            // clobbered on restart, matching INCLUDE_ORGANIZATIONS above.
+            groups: envConfig.gitlab.groups ?? storedGitlab?.groups ?? [],
+            includeSubgroups:
+              envConfig.gitlab.includeSubgroups ?? storedGitlab?.includeSubgroups ?? true,
+            includeOwnProjects:
+              envConfig.gitlab.includeOwnProjects ?? storedGitlab?.includeOwnProjects ?? false,
+            includeForks: envConfig.gitlab.includeForks ?? storedGitlab?.includeForks ?? true,
+            includeArchived:
+              envConfig.gitlab.includeArchived ?? storedGitlab?.includeArchived ?? false,
+            includePrivate:
+              envConfig.gitlab.privateRepositories ?? storedGitlab?.includePrivate ?? true,
+            includePublic:
+              envConfig.gitlab.publicRepositories ?? storedGitlab?.includePublic ?? true,
+          }
+        : null;
 
     // Build Gitea config
     const giteaConfig = {
@@ -390,6 +451,7 @@ export async function initializeConfigFromEnv(): Promise<void> {
         .update(configs)
         .set({
           githubConfig,
+          gitlabConfig,
           giteaConfig,
           scheduleConfig,
           cleanupConfig,
@@ -406,6 +468,7 @@ export async function initializeConfigFromEnv(): Promise<void> {
         name: 'Environment Configuration',
         isActive: true,
         githubConfig,
+        gitlabConfig,
         giteaConfig,
         include: [],
         exclude: [],

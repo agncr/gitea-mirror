@@ -7,9 +7,15 @@
 import { db, configs, repositories } from '@/lib/db';
 import { eq, and, or } from 'drizzle-orm';
 import { syncGiteaRepo, mirrorGithubRepoToGitea } from '@/lib/gitea';
-import { getDecryptedGitHubToken } from '@/lib/utils/config-encryption';
+import {
+  getDecryptedGitHubToken,
+  getDecryptedGitLabToken,
+  configuredSourceProviders,
+  hasGitHubSource,
+} from '@/lib/utils/config-encryption';
+import type { GitRepo } from '@/types/Repository';
 import { formatDuration } from '@/lib/utils/duration-parser';
-import type { Repository } from '@/lib/db/schema';
+import type { Repository, RepoProvider } from '@/lib/db/schema';
 import { repoStatusEnum, repositoryVisibilityEnum } from '@/types/Repository';
 import { mergeGitReposPreferStarred, normalizeGitRepoToInsert, calcBatchSizeForInsert } from '@/lib/repo-utils';
 import { isMirrorableGitHubRepo } from '@/lib/repo-eligibility';
@@ -78,14 +84,132 @@ async function persistScheduleRunState(config: any, currentTime: Date, forceEnab
 /**
  * Run scheduled mirror sync for a single user configuration
  */
+/**
+ * Fetch the mirrorable repositories for a single source.
+ *
+ * Shared by the scheduled sync and the initial auto-start, which previously
+ * carried two copies of this logic and had to be edited in lockstep.
+ */
+async function discoverSourceRepositories(
+  config: any,
+  provider: RepoProvider,
+): Promise<{ repos: GitRepo[]; skippedDisabled: number }> {
+  if (provider === 'gitlab') {
+    const { createGitlabClient, getGitlabRepositories } = await import('@/lib/gitlab');
+    const client = createGitlabClient({
+      url: config.gitlabConfig?.url,
+      token: getDecryptedGitLabToken(config),
+    });
+    const repos = await getGitlabRepositories({ client, config });
+    return { repos, skippedDisabled: 0 };
+  }
+
+  const { getGithubRepositories, getGithubStarredRepositories, createGitHubClient } =
+    await import('@/lib/github');
+
+  // Honors GH_API_URL for GHES / GHEC data residency.
+  const octokit = createGitHubClient(
+    getDecryptedGitHubToken(config),
+    config.userId,
+    config.githubConfig?.owner,
+  );
+
+  const [basicAndForkedRepos, starredRepos] = await Promise.all([
+    getGithubRepositories({ octokit, config }),
+    config.githubConfig?.includeStarred
+      ? getGithubStarredRepositories({ octokit, config })
+      : Promise.resolve([]),
+  ]);
+
+  const allRepos = mergeGitReposPreferStarred(basicAndForkedRepos, starredRepos);
+  const mirrorable = allRepos.filter(isMirrorableGitHubRepo);
+  return { repos: mirrorable, skippedDisabled: allRepos.length - mirrorable.length };
+}
+
+/**
+ * Discover and insert repositories that are new for one source.
+ * Returns how many rows were imported.
+ */
+async function autoImportProvider(
+  config: any,
+  provider: RepoProvider,
+  contextLabel: string,
+): Promise<number> {
+  const userId = config.userId;
+  const { repos: mirrorableRepos, skippedDisabled } = await discoverSourceRepositories(
+    config,
+    provider,
+  );
+
+  const existingRepos = await db
+    .select({
+      normalizedFullName: repositories.normalizedFullName,
+      provider: repositories.provider,
+    })
+    .from(repositories)
+    .where(eq(repositories.userId, userId));
+
+  // Keyed by provider: the same path can exist on both forges.
+  const existingRepoNames = new Set(
+    existingRepos.map(r => `${r.provider}:${r.normalizedFullName}`)
+  );
+  const newRepos = mirrorableRepos.filter(
+    r => !existingRepoNames.has(`${r.provider}:${r.fullName.toLowerCase()}`)
+  );
+
+  if (newRepos.length > 0) {
+    console.log(`[Scheduler] Found ${newRepos.length} new ${provider} repositories for user ${userId}`);
+
+    const reposToInsert = newRepos.map(repo =>
+      normalizeGitRepoToInsert(repo, { userId, configId: config.id })
+    );
+
+    // Batch insert to avoid SQLite parameter limit
+    const sample = reposToInsert[0];
+    const columnCount = Object.keys(sample ?? {}).length || 1;
+    const BATCH_SIZE = calcBatchSizeForInsert(columnCount);
+    for (let i = 0; i < reposToInsert.length; i += BATCH_SIZE) {
+      const batch = reposToInsert.slice(i, i + BATCH_SIZE);
+      await db
+        .insert(repositories)
+        .values(batch)
+        .onConflictDoNothing({ target: [repositories.userId, repositories.provider, repositories.normalizedFullName] });
+    }
+    console.log(`[Scheduler] Successfully imported ${newRepos.length} new ${provider} repositories for user ${userId}`);
+
+    // Log activity for each newly imported repo
+    for (const repo of newRepos) {
+      const sourceLabel = repo.isStarred ? 'starred' : 'owned';
+      await createMirrorJob({
+        userId,
+        repositoryName: repo.fullName,
+        message: `Auto-imported ${sourceLabel} repository: ${repo.fullName}`,
+        details: `Repository ${repo.fullName} was discovered and imported during ${contextLabel}.`,
+        status: 'imported',
+        skipDuplicateEvent: true,
+      });
+    }
+  } else {
+    console.log(`[Scheduler] No new ${provider} repositories found for user ${userId}`);
+  }
+
+  if (skippedDisabled > 0) {
+    console.log(`[Scheduler] Skipped ${skippedDisabled} disabled ${provider} repositories for user ${userId}`);
+  }
+
+  return newRepos.length;
+}
+
 async function runScheduledSync(config: any): Promise<void> {
   const userId = config.userId;
   console.log(`[Scheduler] Running scheduled sync for user ${userId}`);
-  
+
   try {
-    // Check if tokens are configured before proceeding
-    if (!config.githubConfig?.token || !config.giteaConfig?.token) {
-      console.log(`[Scheduler] Skipping sync for user ${userId}: GitHub or Gitea tokens not configured`);
+    // At least one source plus a Gitea destination is required; which sources
+    // exist is decided per config, so a GitLab-only setup is scheduled too.
+    const sourceProviders = configuredSourceProviders(config);
+    if (sourceProviders.length === 0 || !config.giteaConfig?.token) {
+      console.log(`[Scheduler] Skipping sync for user ${userId}: no source token or Gitea token configured`);
       return;
     }
     
@@ -96,76 +220,20 @@ async function runScheduledSync(config: any): Promise<void> {
     console.log(`[Scheduler] Using schedule source for user ${userId}: ${String(source)} (timezone=${timezone})`);
     await persistScheduleRunState(config, currentTime);
     
-    // Auto-discovery: Check for new GitHub repositories
+    // Auto-discovery: check every configured source for new repositories
     if (scheduleConfig.autoImport !== false) {
-      console.log(`[Scheduler] Checking for new GitHub repositories for user ${userId}...`);
+      console.log(`[Scheduler] Checking for new repositories for user ${userId} (sources: ${sourceProviders.join(', ')})...`);
       try {
-        const { getGithubRepositories, getGithubStarredRepositories, createGitHubClient } = await import('@/lib/github');
-        const { v4: uuidv4 } = await import('uuid');
-        const { getDecryptedGitHubToken } = await import('@/lib/utils/config-encryption');
-
-        // Create GitHub client (honors GH_API_URL for GHES / GHEC data residency)
-        const decryptedToken = getDecryptedGitHubToken(config);
-        const octokit = createGitHubClient(decryptedToken, userId, config.githubConfig?.owner);
-
-        // Fetch GitHub data
-        const [basicAndForkedRepos, starredRepos] = await Promise.all([
-          getGithubRepositories({ octokit, config }),
-          config.githubConfig?.includeStarred
-            ? getGithubStarredRepositories({ octokit, config })
-            : Promise.resolve([]),
-        ]);
-        const allGithubRepos = mergeGitReposPreferStarred(basicAndForkedRepos, starredRepos);
-        const mirrorableGithubRepos = allGithubRepos.filter(isMirrorableGitHubRepo);
-
-        // Check for new repositories
-        const existingRepos = await db
-          .select({ normalizedFullName: repositories.normalizedFullName })
-          .from(repositories)
-          .where(eq(repositories.userId, userId));
-        
-        const existingRepoNames = new Set(existingRepos.map(r => r.normalizedFullName));
-        const newRepos = mirrorableGithubRepos.filter(r => !existingRepoNames.has(r.fullName.toLowerCase()));
-        
-        if (newRepos.length > 0) {
-          console.log(`[Scheduler] Found ${newRepos.length} new repositories for user ${userId}`);
-          
-          // Insert new repositories
-          const reposToInsert = newRepos.map(repo => 
-            normalizeGitRepoToInsert(repo, { userId, configId: config.id })
-          );
-          
-          // Batch insert to avoid SQLite parameter limit
-          const sample = reposToInsert[0];
-          const columnCount = Object.keys(sample ?? {}).length || 1;
-          const BATCH_SIZE = calcBatchSizeForInsert(columnCount);
-          for (let i = 0; i < reposToInsert.length; i += BATCH_SIZE) {
-            const batch = reposToInsert.slice(i, i + BATCH_SIZE);
-            await db
-              .insert(repositories)
-              .values(batch)
-              .onConflictDoNothing({ target: [repositories.userId, repositories.normalizedFullName] });
+        for (const provider of sourceProviders) {
+          // One failing source must not stop the others.
+          try {
+            await autoImportProvider(config, provider, 'scheduled sync');
+          } catch (providerError) {
+            console.error(
+              `[Scheduler] Failed to auto-import ${provider} repositories for user ${userId}:`,
+              providerError,
+            );
           }
-          console.log(`[Scheduler] Successfully imported ${newRepos.length} new repositories for user ${userId}`);
-
-          // Log activity for each newly imported repo
-          for (const repo of newRepos) {
-            const sourceLabel = repo.isStarred ? 'starred' : 'owned';
-            await createMirrorJob({
-              userId,
-              repositoryName: repo.fullName,
-              message: `Auto-imported ${sourceLabel} repository: ${repo.fullName}`,
-              details: `Repository ${repo.fullName} was discovered and imported during scheduled sync.`,
-              status: 'imported',
-              skipDuplicateEvent: true,
-            });
-          }
-        } else {
-          console.log(`[Scheduler] No new repositories found for user ${userId}`);
-        }
-        const skippedDisabledCount = allGithubRepos.length - mirrorableGithubRepos.length;
-        if (skippedDisabledCount > 0) {
-          console.log(`[Scheduler] Skipped ${skippedDisabledCount} disabled GitHub repositories for user ${userId}`);
         }
       } catch (error) {
         console.error(`[Scheduler] Failed to auto-import repositories for user ${userId}:`, error);
@@ -177,9 +245,14 @@ async function runScheduledSync(config: any): Promise<void> {
       console.log(`[Scheduler] Checking for orphaned repositories to cleanup for user ${userId}...`);
       try {
         const { identifyOrphanedRepositories, handleOrphanedRepository } = await import('@/lib/repository-cleanup-service');
-        
-        const orphanedRepos = await identifyOrphanedRepositories(config);
-        
+
+        // Per source: a repository is only ever compared against its own forge.
+        const orphanedRepos: any[] = [];
+        for (const provider of configuredSourceProviders(config)) {
+          orphanedRepos.push(...(await identifyOrphanedRepositories(config, provider)));
+        }
+
+
         if (orphanedRepos.length > 0) {
           console.log(`[Scheduler] Found ${orphanedRepos.length} orphaned repositories for cleanup`);
           
@@ -241,10 +314,20 @@ async function runScheduledSync(config: any): Promise<void> {
         if (reposNeedingMirror.length > 0) {
           console.log(`[Scheduler] Found ${reposNeedingMirror.length} repositories that need initial mirroring`);
 
-          // Prepare Octokit client (honors GH_API_URL for GHES / GHEC data residency)
-          const decryptedToken = getDecryptedGitHubToken(config);
-          const { createGitHubClient } = await import('@/lib/github');
-          const octokit = createGitHubClient(decryptedToken, userId, config.githubConfig?.owner);
+          // Build the Octokit client lazily and only when a GitHub repository
+          // is actually in the batch: a GitLab-only config has no GitHub token
+          // to decrypt, and asking for one would throw before any mirroring.
+          let octokit: Awaited<ReturnType<typeof import('@/lib/github')['createGitHubClient']>> | null = null;
+          const ensureOctokit = async () => {
+            if (octokit) return octokit;
+            const { createGitHubClient } = await import('@/lib/github');
+            octokit = createGitHubClient(
+              getDecryptedGitHubToken(config),
+              userId,
+              config.githubConfig?.owner,
+            );
+            return octokit;
+          };
 
           // Process repositories in batches
           const batchSize = scheduleConfig.batchSize || 10;
@@ -288,7 +371,12 @@ async function runScheduledSync(config: any): Promise<void> {
                     }
                   }
 
-                  await mirrorGithubRepoToGitea({ octokit, repository, config });
+                  // GitLab repositories mirror code through Gitea's migration
+                  // and need no source API client.
+                  const repoOctokit =
+                    repository.provider === 'gitlab' ? null : await ensureOctokit();
+
+                  await mirrorGithubRepoToGitea({ octokit: repoOctokit, repository, config });
                   console.log(`[Scheduler] Auto-mirrored repository: ${repo.fullName}`);
                 } catch (error) {
                   console.error(`[Scheduler] Failed to auto-mirror repository ${repo.fullName}:`, error);
@@ -490,8 +578,9 @@ async function performInitialAutoStart(): Promise<void> {
       .where(eq(configs.isActive, true));
     
     for (const config of activeConfigs) {
-      // Skip if tokens are not configured
-      if (!config.githubConfig?.token || !config.giteaConfig?.token) {
+      // Skip unless at least one source and the Gitea destination are usable.
+      const sourceProviders = configuredSourceProviders(config as any);
+      if (sourceProviders.length === 0 || !config.giteaConfig?.token) {
         console.log(`[Scheduler] Skipping auto-start for user ${config.userId}: tokens not configured`);
         continue;
       }
@@ -509,73 +598,18 @@ async function performInitialAutoStart(): Promise<void> {
       console.log(`[Scheduler] Auto-starting for user ${config.userId}...`);
       
       try {
-        // Step 1: Import repositories from GitHub
-        console.log(`[Scheduler] Step 1: Importing repositories from GitHub for user ${config.userId}...`);
-        const { getGithubRepositories, getGithubStarredRepositories, createGitHubClient } = await import('@/lib/github');
-        const { v4: uuidv4 } = await import('uuid');
-
-        // Create GitHub client (honors GH_API_URL for GHES / GHEC data residency)
-        const decryptedToken = getDecryptedGitHubToken(config);
-        const octokit = createGitHubClient(decryptedToken, config.userId, config.githubConfig?.owner);
-        
-        // Fetch GitHub data
-        const [basicAndForkedRepos, starredRepos] = await Promise.all([
-          getGithubRepositories({ octokit, config }),
-          config.githubConfig?.includeStarred
-            ? getGithubStarredRepositories({ octokit, config })
-            : Promise.resolve([]),
-        ]);
-        const allGithubRepos = mergeGitReposPreferStarred(basicAndForkedRepos, starredRepos);
-        const mirrorableGithubRepos = allGithubRepos.filter(isMirrorableGitHubRepo);
-        
-        // Check for new repositories
-        const existingRepos = await db
-          .select({ normalizedFullName: repositories.normalizedFullName })
-          .from(repositories)
-          .where(eq(repositories.userId, config.userId));
-        
-        const existingRepoNames = new Set(existingRepos.map(r => r.normalizedFullName));
-        const reposToImport = mirrorableGithubRepos.filter(r => !existingRepoNames.has(r.fullName.toLowerCase()));
-        
-        if (reposToImport.length > 0) {
-          console.log(`[Scheduler] Importing ${reposToImport.length} repositories for user ${config.userId}...`);
-          
-          // Insert new repositories
-          const reposToInsert = reposToImport.map(repo => 
-            normalizeGitRepoToInsert(repo, { userId: config.userId, configId: config.id })
-          );
-          
-          // Batch insert to avoid SQLite parameter limit
-          const sample = reposToInsert[0];
-          const columnCount = Object.keys(sample ?? {}).length || 1;
-          const BATCH_SIZE = calcBatchSizeForInsert(columnCount);
-          for (let i = 0; i < reposToInsert.length; i += BATCH_SIZE) {
-            const batch = reposToInsert.slice(i, i + BATCH_SIZE);
-            await db
-              .insert(repositories)
-              .values(batch)
-              .onConflictDoNothing({ target: [repositories.userId, repositories.normalizedFullName] });
+        // Step 1: Import repositories from every configured source. Uses the
+        // same helper as the scheduled sync so the two paths cannot drift.
+        console.log(`[Scheduler] Step 1: Importing repositories for user ${config.userId} (sources: ${sourceProviders.join(', ')})...`);
+        for (const provider of sourceProviders) {
+          try {
+            await autoImportProvider(config, provider, 'auto-start');
+          } catch (providerError) {
+            console.error(
+              `[Scheduler] Failed to import ${provider} repositories for user ${config.userId}:`,
+              providerError,
+            );
           }
-          console.log(`[Scheduler] Successfully imported ${reposToImport.length} repositories`);
-
-          // Log activity for each newly imported repo
-          for (const repo of reposToImport) {
-            const sourceLabel = repo.isStarred ? 'starred' : 'owned';
-            await createMirrorJob({
-              userId: config.userId,
-              repositoryName: repo.fullName,
-              message: `Auto-imported ${sourceLabel} repository: ${repo.fullName}`,
-              details: `Repository ${repo.fullName} was discovered and imported during auto-start.`,
-              status: 'imported',
-              skipDuplicateEvent: true,
-            });
-          }
-        } else {
-          console.log(`[Scheduler] No new repositories to import for user ${config.userId}`);
-        }
-        const skippedDisabledCount = allGithubRepos.length - mirrorableGithubRepos.length;
-        if (skippedDisabledCount > 0) {
-          console.log(`[Scheduler] Skipped ${skippedDisabledCount} disabled GitHub repositories for user ${config.userId}`);
         }
 
         // Check if we already have mirrored repositories (indicating this isn't first run)
@@ -649,9 +683,21 @@ async function performInitialAutoStart(): Promise<void> {
         if (reposNeedingMirror.length > 0) {
           console.log(`[Scheduler] Found ${reposNeedingMirror.length} repositories that need mirroring`);
           
-          // Reuse the octokit instance from above
-          // (octokit was already created in the import phase)
-          
+          // Build the Octokit client lazily and only when a GitHub repository
+          // is actually in the batch: a GitLab-only config has no GitHub token
+          // to decrypt, and asking for one would throw before any mirroring.
+          let octokit: Awaited<ReturnType<typeof import('@/lib/github')['createGitHubClient']>> | null = null;
+          const ensureOctokit = async () => {
+            if (octokit) return octokit;
+            const { createGitHubClient } = await import('@/lib/github');
+            octokit = createGitHubClient(
+              getDecryptedGitHubToken(config as any),
+              config.userId,
+              config.githubConfig?.owner,
+            );
+            return octokit;
+          };
+
           // Process repositories in batches
           const batchSize = config.scheduleConfig?.batchSize || 5;
           for (let i = 0; i < reposNeedingMirror.length; i += batchSize) {
@@ -672,8 +718,13 @@ async function performInitialAutoStart(): Promise<void> {
                     visibility: repositoryVisibilityEnum.parse(repo.visibility),
                   };
                   
-                  await mirrorGithubRepoToGitea({ 
-                    octokit,
+                  // GitLab repositories mirror code through Gitea's migration
+                  // and need no source API client.
+                  const repoOctokit =
+                    repository.provider === 'gitlab' ? null : await ensureOctokit();
+
+                  await mirrorGithubRepoToGitea({
+                    octokit: repoOctokit,
                     repository,
                     config
                   });
@@ -752,13 +803,14 @@ async function schedulerLoop(): Promise<void> {
       config.scheduleConfig?.enabled === true
     );
     
-    // Further filter configs that have valid tokens
+    // Further filter configs that have valid tokens. A GitLab-only setup is
+    // schedulable too, so this asks for "any source" rather than GitHub.
     const validConfigs = enabledConfigs.filter(config => {
-      const hasGitHubToken = !!config.githubConfig?.token;
+      const sources = configuredSourceProviders(config as any);
       const hasGiteaToken = !!config.giteaConfig?.token;
-      
-      if (!hasGitHubToken || !hasGiteaToken) {
-        console.log(`[Scheduler] User ${config.userId}: Scheduling enabled but tokens missing (GitHub: ${hasGitHubToken}, Gitea: ${hasGiteaToken})`);
+
+      if (sources.length === 0 || !hasGiteaToken) {
+        console.log(`[Scheduler] User ${config.userId}: Scheduling enabled but tokens missing (sources: ${sources.join(', ') || 'none'}, Gitea: ${hasGiteaToken})`);
         return false;
       }
       return true;

@@ -8,7 +8,8 @@ import { db, configs, repositories } from '@/lib/db';
 import { eq, and, or, sql, not, inArray } from 'drizzle-orm';
 import { createGitHubClient, getGithubRepositories, getGithubStarredRepositories } from '@/lib/github';
 import { createGiteaClient, deleteGiteaRepo, archiveGiteaRepo, getGiteaRepoOwnerAsync, checkRepoLocation } from '@/lib/gitea';
-import { getDecryptedGitHubToken, getDecryptedGiteaToken } from '@/lib/utils/config-encryption';
+import { getDecryptedGitHubToken, getDecryptedGiteaToken, getDecryptedGitLabToken, configuredSourceProviders } from '@/lib/utils/config-encryption';
+import type { RepoProvider } from '@/lib/db/schema';
 import { publishEvent } from '@/lib/events';
 import { isMirrorableGitHubRepo } from '@/lib/repo-eligibility';
 
@@ -75,76 +76,214 @@ export function planOrphanedRepoAction(
 }
 
 /**
- * Identify orphaned repositories for a user
- * These are repositories that exist in our database (and likely in Gitea)
- * but are no longer in GitHub based on current criteria
+ * A source-specific way to answer "does this repository still exist upstream?".
+ *
+ * `sourceRepoFullNames` is the cheap bulk signal; `confirmGone` is the targeted
+ * second opinion that actually decides. Both are scoped to ONE provider, which
+ * is what keeps a GitHub cleanup run from ever looking at GitLab rows (and
+ * archiving every one of them, since they are absent from GitHub by
+ * definition).
  */
-async function identifyOrphanedRepositories(config: any): Promise<any[]> {
+interface OrphanProbe {
+  sourceRepoFullNames: Map<string, any>;
+  confirmGone: (repo: any) => Promise<boolean>;
+}
+
+async function buildGithubOrphanProbe(config: any): Promise<OrphanProbe | null> {
   const userId = config.userId;
-  
+  const decryptedToken = getDecryptedGitHubToken(config);
+  const githubUsername = config.githubConfig?.owner || undefined;
+  const octokit = createGitHubClient(decryptedToken, userId, githubUsername);
+
+  let allGithubRepos: any[] = [];
   try {
-    // Get current GitHub repositories with rate limit tracking
-    const decryptedToken = getDecryptedGitHubToken(config);
-    const githubUsername = config.githubConfig?.owner || undefined;
-    const octokit = createGitHubClient(decryptedToken, userId, githubUsername);
-    
-    let allGithubRepos = [];
-    let githubApiAccessible = true;
-    
-    try {
-      // Fetch GitHub data. Always include collaborator repos and bypass the
-      // organization allowlist here regardless of the user's import filters,
-      // otherwise repos previously mirrored as a collaborator or from an org the
-      // user later removed from the allowlist would be flagged as orphaned and
-      // archived/deleted as soon as the user narrows those filters.
-      const [basicAndForkedRepos, starredRepos] = await Promise.all([
-        getGithubRepositories({
-          octokit,
-          config,
-          includeCollaboratorReposOverride: true,
-          includeAllOrgsOverride: true,
-        }),
-        config.githubConfig?.includeStarred
-          ? getGithubStarredRepositories({ octokit, config })
-          : Promise.resolve([]),
-      ]);
-      
-      allGithubRepos = [...basicAndForkedRepos, ...starredRepos];
-    } catch (githubError: any) {
-      // Handle GitHub API errors gracefully
-      console.warn(`[Repository Cleanup] GitHub API error for user ${userId}: ${githubError.message}`);
-      
-      // Check if it's a critical error (like account deleted/banned)
-      if (githubError.status === 404 || githubError.status === 403) {
-        console.error(`[Repository Cleanup] CRITICAL: GitHub account may be deleted/banned. Skipping cleanup to prevent data loss.`);
-        console.error(`[Repository Cleanup] Consider using CLEANUP_ORPHANED_REPO_ACTION=archive instead of delete for safety.`);
-        
-        // Return empty array to skip cleanup entirely when GitHub account is inaccessible
-        return [];
+    // Fetch GitHub data. Always include collaborator repos and bypass the
+    // organization allowlist here regardless of the user's import filters,
+    // otherwise repos previously mirrored as a collaborator or from an org the
+    // user later removed from the allowlist would be flagged as orphaned and
+    // archived/deleted as soon as the user narrows those filters.
+    const [basicAndForkedRepos, starredRepos] = await Promise.all([
+      getGithubRepositories({
+        octokit,
+        config,
+        includeCollaboratorReposOverride: true,
+        includeAllOrgsOverride: true,
+      }),
+      config.githubConfig?.includeStarred
+        ? getGithubStarredRepositories({ octokit, config })
+        : Promise.resolve([]),
+    ]);
+
+    allGithubRepos = [...basicAndForkedRepos, ...starredRepos];
+  } catch (githubError: any) {
+    console.warn(`[Repository Cleanup] GitHub API error for user ${userId}: ${githubError.message}`);
+
+    if (githubError.status === 404 || githubError.status === 403) {
+      console.error(`[Repository Cleanup] CRITICAL: GitHub account may be deleted/banned. Skipping cleanup to prevent data loss.`);
+      console.error(`[Repository Cleanup] Consider using CLEANUP_ORPHANED_REPO_ACTION=archive instead of delete for safety.`);
+      return null;
+    }
+
+    console.error(`[Repository Cleanup] Skipping cleanup due to GitHub API error. This prevents accidental deletion of backups.`);
+    return null;
+  }
+
+  return {
+    sourceRepoFullNames: new Map(allGithubRepos.map((repo) => [repo.fullName, repo] as const)),
+    confirmGone: async (repo: any) => {
+      if (repo.isStarred) {
+        try {
+          await octokit.rest.activity.checkRepoIsStarredByAuthenticatedUser({
+            owner: repo.owner,
+            repo: repo.name,
+          });
+          // Resolves (no throw) => still starred; the bulk star fetch
+          // missed it. Fail safe: do not treat as orphaned.
+          return false;
+        } catch (starError: any) {
+          if (starError?.status === 404) return true;
+          console.warn(
+            `[Repository Cleanup] Direct star-check for ${repo.fullName} failed with a non-404 error; skipping this cycle to be safe: ${
+              starError instanceof Error ? starError.message : String(starError)
+            }`
+          );
+          return false;
+        }
       }
-      
-      // For other errors, also skip cleanup to be safe
-      console.error(`[Repository Cleanup] Skipping cleanup due to GitHub API error. This prevents accidental deletion of backups.`);
+
+      try {
+        await octokit.rest.repos.get({ owner: repo.owner, repo: repo.name });
+        // Resolves (no throw) => repo still exists; the bulk fetch missed
+        // it (e.g. an org-allowlist edge case). Fail safe: not orphaned.
+        return false;
+      } catch (repoError: any) {
+        if (repoError?.status === 404) return true;
+        console.warn(
+          `[Repository Cleanup] Direct existence check for ${repo.fullName} failed with a non-404 error; skipping this cycle to be safe: ${
+            repoError instanceof Error ? repoError.message : String(repoError)
+          }`
+        );
+        return false;
+      }
+    },
+  };
+}
+
+async function buildGitlabOrphanProbe(config: any): Promise<OrphanProbe | null> {
+  const userId = config.userId;
+  const { createGitlabClient, getGitlabRepositories, gitlabProjectExists, gitlabProjectPathFromUrl } =
+    await import('@/lib/gitlab');
+
+  const instanceUrl = config.gitlabConfig?.url;
+  const client = createGitlabClient({
+    url: instanceUrl,
+    token: getDecryptedGitLabToken(config),
+  });
+
+  let allGitlabRepos: any[] = [];
+  try {
+    // Bypass the configured group allowlist for the same reason the GitHub
+    // probe bypasses the org allowlist: narrowing which groups you import
+    // must never make already-mirrored projects look deleted.
+    allGitlabRepos = await getGitlabRepositories({
+      client,
+      config,
+      includeAllGroupsOverride: true,
+    });
+  } catch (gitlabError: any) {
+    console.error(
+      `[Repository Cleanup] GitLab API error for user ${userId}; skipping cleanup to prevent data loss: ${
+        gitlabError instanceof Error ? gitlabError.message : String(gitlabError)
+      }`
+    );
+    return null;
+  }
+
+  return {
+    sourceRepoFullNames: new Map(allGitlabRepos.map((repo) => [repo.fullName, repo] as const)),
+    confirmGone: async (repo: any) => {
+      // Use the stored URL, not fullName: fullName holds the flattened owner.
+      const projectPath = gitlabProjectPathFromUrl(repo.url || repo.cloneUrl, instanceUrl);
+      const exists = await gitlabProjectExists({ client, projectPath });
+      // null (unknown) must not count as gone.
+      return exists === false;
+    },
+  };
+}
+
+/**
+ * The row filter for orphan candidates: this user's repositories, on this
+ * source only.
+ *
+ * Exported and kept separate because the provider term is the single most
+ * destructive thing to get wrong here — without it a GitHub cleanup run sees
+ * every GitLab repository as missing from GitHub and archives all of them.
+ * See repository-cleanup-service.test.ts.
+ */
+export function orphanCandidateFilter(userId: string, provider: RepoProvider) {
+  return and(eq(repositories.userId, userId), eq(repositories.provider, provider));
+}
+
+/**
+ * Second line of defense behind {@link orphanCandidateFilter}: no row from a
+ * different forge may ever become an orphan candidate, whatever the query
+ * returned. Rows written before GitLab support have no provider and are
+ * GitHub's.
+ */
+export function belongsToProvider(
+  repo: { provider?: string | null },
+  provider: RepoProvider
+): boolean {
+  return (repo.provider ?? "github") === provider;
+}
+
+/**
+ * Identify orphaned repositories for one source of a user.
+ *
+ * Scoped to a single `provider`: a repository is only compared against the
+ * forge it actually came from.
+ */
+async function identifyOrphanedRepositories(
+  config: any,
+  provider: RepoProvider = 'github'
+): Promise<any[]> {
+  const userId = config.userId;
+
+  try {
+    const probe =
+      provider === 'gitlab'
+        ? await buildGitlabOrphanProbe(config)
+        : await buildGithubOrphanProbe(config);
+
+    // A null probe means the source could not be listed reliably; skip the
+    // whole cycle rather than risk deleting live mirrors.
+    if (!probe) {
       return [];
     }
-    
-    const githubReposByFullName = new Map(
-      allGithubRepos.map((repo) => [repo.fullName, repo] as const)
-    );
-    
-    // Get all repositories from our database
+
+    const sourceReposByFullName = probe.sourceRepoFullNames;
+
+    // Only this provider's rows. Without this scoping a GitHub cleanup run
+    // would see every GitLab repository as missing from GitHub and archive the
+    // lot on the first pass.
     const dbRepos = await db
       .select()
       .from(repositories)
-      .where(eq(repositories.userId, userId));
-    
-    // Only identify repositories as orphaned if we successfully accessed GitHub
-    // This prevents false positives when GitHub is down or account is inaccessible.
+      .where(orphanCandidateFilter(userId, provider));
+
+    // Only identify repositories as orphaned if we successfully listed the
+    // source. This prevents false positives when the forge is down or the
+    // account is inaccessible.
     //
     // First pass (sync, cheap): filter down to repos that merely *look*
     // orphaned based on map membership against the single bulk fetch above.
     // This is the false-positive-prone signal — see resolveOrphanVerdict.
     const candidateOrphans = dbRepos.filter(repo => {
+      // Never judge a repository against a forge it did not come from.
+      if (!belongsToProvider(repo, provider)) {
+        return false;
+      }
+
       // Skip repositories we've already archived/preserved
       if (repo.status === 'archived' || repo.isArchived) {
         console.log(`[Repository Cleanup] Skipping ${repo.fullName} - already archived`);
@@ -158,14 +297,14 @@ async function identifyOrphanedRepositories(config: any): Promise<any[]> {
         return false;
       }
 
-      const githubRepo = githubReposByFullName.get(repo.fullName);
-      if (!githubRepo) {
+      const sourceRepo = sourceReposByFullName.get(repo.fullName);
+      if (!sourceRepo) {
         // Missing from the bulk list — candidate for direct confirmation below,
         // not yet a confirmed orphan.
         return true;
       }
 
-      if (!isMirrorableGitHubRepo(githubRepo)) {
+      if (provider === 'github' && !isMirrorableGitHubRepo(sourceRepo)) {
         console.log(`[Repository Cleanup] Preserving ${repo.fullName} - repository is disabled on GitHub`);
         return false;
       }
@@ -178,52 +317,16 @@ async function identifyOrphanedRepositories(config: any): Promise<any[]> {
     }
 
     // Second pass (async, targeted): confirm each candidate directly against
-    // GitHub before finalizing it as orphaned. This only adds extra API calls
-    // for the (presumably small) set of repos that look orphaned, not for
+    // the source before finalizing it as orphaned. This only adds extra API
+    // calls for the (presumably small) set of repos that look orphaned, not for
     // every repo, so it shouldn't meaningfully increase rate-limit pressure
     // in the common case (few or no orphans per run). Promise.allSettled so
     // one repo's verification failure can't block the others.
     const verificationOutcomes = await Promise.allSettled(
-      candidateOrphans.map(async (repo) => {
-        if (repo.isStarred) {
-          try {
-            await octokit.rest.activity.checkRepoIsStarredByAuthenticatedUser({
-              owner: repo.owner,
-              repo: repo.name,
-            });
-            // Resolves (no throw) => still starred; the bulk star fetch
-            // missed it. Fail safe: do not treat as orphaned.
-            return { repo, directCheckConfirmsGone: false };
-          } catch (starError: any) {
-            if (starError?.status === 404) {
-              return { repo, directCheckConfirmsGone: true };
-            }
-            console.warn(
-              `[Repository Cleanup] Direct star-check for ${repo.fullName} failed with a non-404 error; skipping this cycle to be safe: ${
-                starError instanceof Error ? starError.message : String(starError)
-              }`
-            );
-            return { repo, directCheckConfirmsGone: false };
-          }
-        }
-
-        try {
-          await octokit.rest.repos.get({ owner: repo.owner, repo: repo.name });
-          // Resolves (no throw) => repo still exists; the bulk fetch missed
-          // it (e.g. an org-allowlist edge case). Fail safe: not orphaned.
-          return { repo, directCheckConfirmsGone: false };
-        } catch (repoError: any) {
-          if (repoError?.status === 404) {
-            return { repo, directCheckConfirmsGone: true };
-          }
-          console.warn(
-            `[Repository Cleanup] Direct existence check for ${repo.fullName} failed with a non-404 error; skipping this cycle to be safe: ${
-              repoError instanceof Error ? repoError.message : String(repoError)
-            }`
-          );
-          return { repo, directCheckConfirmsGone: false };
-        }
-      })
+      candidateOrphans.map(async (repo) => ({
+        repo,
+        directCheckConfirmsGone: await probe.confirmGone(repo),
+      }))
     );
 
     const orphanedRepos = verificationOutcomes
@@ -482,8 +585,13 @@ async function runRepositoryCleanup(config: any): Promise<{
       console.log(`[Repository Cleanup] deleteFromGitea is disabled: orphaned repositories will only be updated in gitea-mirror's database; the Gitea copies stay untouched. Set CLEANUP_DELETE_FROM_GITEA=true to also apply the '${cleanupConfig.orphanedRepoAction || 'archive'}' action on Gitea.`);
     }
     
-    // Identify orphaned repositories
-    const orphanedRepos = await identifyOrphanedRepositories(config);
+    // Identify orphaned repositories, one source at a time. Each provider is
+    // compared only against its own forge.
+    const providers = configuredSourceProviders(config);
+    const orphanedRepos: any[] = [];
+    for (const provider of providers) {
+      orphanedRepos.push(...(await identifyOrphanedRepositories(config, provider)));
+    }
     results.orphanedCount = orphanedRepos.length;
     
     if (orphanedRepos.length === 0) {

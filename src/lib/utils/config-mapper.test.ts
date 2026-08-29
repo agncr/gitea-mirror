@@ -1,9 +1,11 @@
-import { expect, test } from "bun:test";
+import { describe, expect, test } from "bun:test";
 import {
   mapDbScheduleToUi,
   mapDbToUiConfig,
   mapUiScheduleToDb,
   mapUiToDbConfig,
+  mapUiToDbGitlabConfig,
+  resolveGitlabConfigIntent,
 } from "./config-mapper";
 import { githubConfigSchema, scheduleConfigSchema } from "@/lib/db/schema";
 import type {
@@ -256,4 +258,72 @@ test("mapUiToDbConfig resets a stale skip forkStrategy to reference when skipFor
     giteaConfig: { forkStrategy: "skip" },
   });
   expect(db.giteaConfig.forkStrategy).toBe("reference");
+});
+
+describe("resolveGitlabConfigIntent", () => {
+  test("an absent key keeps whatever is stored", () => {
+    // Older clients and saves from other sections omit the key entirely; they
+    // must not wipe an env-provisioned GitLab source (issue #338 rule).
+    expect(resolveGitlabConfigIntent(undefined)).toEqual({ action: "keep" });
+  });
+
+  test("an explicit null removes the source", () => {
+    // Without a distinct disconnect signal, a leaked token could never be
+    // dropped, because an empty token means "keep the stored one".
+    expect(resolveGitlabConfigIntent(null)).toEqual({ action: "remove" });
+  });
+
+  test("an object is a configuration to store", () => {
+    const value = { url: "https://gitlab.com", token: "glpat-x" };
+    expect(resolveGitlabConfigIntent(value)).toEqual({ action: "set", value } as any);
+  });
+
+  test("keep and remove are not collapsed into one falsy case", () => {
+    expect(resolveGitlabConfigIntent(undefined)).not.toEqual(
+      resolveGitlabConfigIntent(null),
+    );
+  });
+});
+
+describe("mapUiToDbGitlabConfig", () => {
+  const stored = {
+    url: "https://gitlab.example.com",
+    token: "stored-token",
+    groups: ["acme"],
+    includeSubgroups: true,
+    includeOwnProjects: false,
+    includeForks: true,
+    includeArchived: false,
+    includePrivate: true,
+    includePublic: true,
+  };
+
+  test("an empty token preserves the stored one", () => {
+    const result = mapUiToDbGitlabConfig(
+      { ...stored, token: "" } as any,
+      stored as any,
+    );
+    expect(result?.token).toBe("stored-token");
+  });
+
+  test("a new token replaces the stored one", () => {
+    const result = mapUiToDbGitlabConfig(
+      { ...stored, token: "fresh-token" } as any,
+      stored as any,
+    );
+    expect(result?.token).toBe("fresh-token");
+  });
+
+  test("normalizes group paths and drops duplicates", () => {
+    const result = mapUiToDbGitlabConfig(
+      { ...stored, groups: ["/acme/", "ACME", " acme/platform "] } as any,
+      stored as any,
+    );
+    expect(result?.groups).toEqual(["acme", "acme/platform"]);
+  });
+
+  test("defaults the URL when the form leaves it blank", () => {
+    const result = mapUiToDbGitlabConfig({ ...stored, url: "  " } as any, null);
+    expect(result?.url).toBe("https://gitlab.com");
+  });
 });

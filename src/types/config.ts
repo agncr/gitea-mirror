@@ -69,6 +69,27 @@ export interface GitHubConfig {
   starredReposMode?: StarredReposMode;
 }
 
+/**
+ * GitLab source settings. Unlike {@link GitHubConfig}, the UI shape is identical
+ * to the stored shape, so `config-mapper.ts` passes it through unrenamed.
+ *
+ * Destination placement (mirror strategy, default org, ...) is shared across all
+ * sources and lives in the GitHub/Gitea config — see `getMirrorPlacementSettings`.
+ */
+export interface GitLabConfig {
+  url: string;
+  token: string;
+  username?: string;
+  /** Top-level group paths to mirror, e.g. ["acme", "acme/platform"]. */
+  groups: string[];
+  includeSubgroups: boolean;
+  includeOwnProjects: boolean;
+  includeForks: boolean;
+  includeArchived: boolean;
+  includePrivate: boolean;
+  includePublic: boolean;
+}
+
 export interface MirrorOptions {
   mirrorReleases: boolean;
   releaseLimit?: number;  // Limit number of releases to mirror (default: 10)
@@ -93,6 +114,12 @@ export interface AdvancedOptions {
 export interface SaveConfigApiRequest {
   userId: string;
   githubConfig: GitHubConfig;
+  /**
+   * Optional. Omitting the key (or sending null) preserves whatever is stored,
+   * so a client that predates GitLab support cannot wipe an env-provisioned
+   * GitLab source by saving an unrelated section.
+   */
+  gitlabConfig?: GitLabConfig | null;
   giteaConfig: GiteaConfig;
   scheduleConfig: ScheduleConfig;
   cleanupConfig: DatabaseCleanupConfig;
@@ -154,6 +181,7 @@ export interface ConfigApiResponse {
   name: string;
   isActive: boolean;
   githubConfig: GitHubConfig;
+  gitlabConfig?: GitLabConfig | null;
   giteaConfig: GiteaConfig;
   scheduleConfig: ScheduleConfig;
   cleanupConfig: DatabaseCleanupConfig;

@@ -8,6 +8,7 @@ Gitea Mirror is a self-hosted web application that automatically mirrors reposit
 
 **Key capabilities:**
 - Mirrors public, private, and starred GitHub repos to Gitea
+- Mirrors GitLab groups (including nested subgroups) to Gitea — code only for now
 - Supports metadata mirroring (issues, PRs as issues, labels, milestones, releases, wiki)
 - Git LFS support
 - Multiple authentication methods (email/password, OIDC/SSO, header auth)
@@ -176,6 +177,7 @@ scripts/                # Utility scripts
 
 #### 3. GitHub ↔ Gitea Mirroring
 - **GitHub Client:** `src/lib/github.ts` - Octokit with rate limit tracking
+- **GitLab Client:** `src/lib/gitlab.ts` - REST v4 over the shared fetch helper; group/subgroup discovery and path flattening
 - **Gitea Client:** `src/lib/gitea.ts` - Basic repo operations
 - **Enhanced Gitea:** `src/lib/gitea-enhanced.ts` - Metadata mirroring (issues, PRs, releases)
 
@@ -195,6 +197,30 @@ scripts/                # Utility scripts
 - Labels and milestones preserved
 - Wiki content cloned if enabled
 - **Sequential processing:** Issues/PRs mirrored one at a time to prevent out-of-order creation (see `src/lib/gitea-enhanced.ts`)
+
+#### 3b. Multi-source support (GitHub + GitLab)
+
+Repositories and organizations carry a `provider` column (`github` | `gitlab`,
+defaulting to `github` for pre-existing rows). Rules that follow from it:
+
+- **Unique indexes are provider-scoped** — `(userId, provider, fullName)`. The
+  same path can exist on both forges.
+- **Orphan cleanup is per source.** `identifyOrphanedRepositories(config, provider)`
+  only ever compares a repository against its own forge; a GitHub run must never
+  see GitLab rows, or it would archive all of them.
+- **GitLab subgroups are flattened at discovery time** (`flattenGitlabPath`), so
+  everything downstream keeps the single-slash `owner/repo` assumption. The real
+  GitLab path survives on `url` / `cloneUrl` — use those, never `fullName`, when
+  talking to the GitLab API.
+- **Auth differs, the migrate payload does not.** `buildSourceAuthPayload`
+  dispatches on provider (GitLab needs `auth_username: "oauth2"`); the Gitea
+  migrate call already uses `service: "git"` for both.
+- **Metadata mirroring is GitHub-only.** GitLab repos reach the mirror path with
+  `octokit: null` and skip issues/PRs/releases/labels/milestones and force-push
+  detection. Wiki still works, since Gitea clones it during migration.
+- Destination placement (`mirrorStrategy`, `defaultOrg`, `starredRepos*`) is
+  shared across sources and read via `getMirrorPlacementSettings`; it lives in
+  `githubConfig` for historical reasons.
 
 #### 4. Scheduler Service
 - **Location:** `src/lib/scheduler-service.ts`

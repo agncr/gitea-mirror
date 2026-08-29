@@ -10,7 +10,8 @@ import {
 } from "@tanstack/react-table";
 import { useVirtualizer } from "@tanstack/react-virtual";
 import { FlipHorizontal, GitFork, MoreVertical, RefreshCw, RotateCcw, Star, Lock, Ban, Check, ChevronDown, SlidersHorizontal, Trash2, X } from "lucide-react";
-import { SiGithub, SiGitea } from "react-icons/si";
+import { SiGithub, SiGitea, SiGitlab } from "react-icons/si";
+import { sourceProviderOf, sourceProviderLabel } from "@/lib/utils/source-provider-ui";
 import type { MirrorOverrides, Repository } from "@/lib/db/schema";
 import { Button } from "@/components/ui/button";
 import { formatLastSyncTime } from "@/lib/utils";
@@ -117,6 +118,9 @@ export default function RepositoryTable({
 
   useEffect(() => {
     const orgName = overridesTarget?.organization;
+    // Same-named organizations can exist on both forges, so the override
+    // lookup has to say which one it means.
+    const orgProvider = sourceProviderOf((overridesTarget as any)?.provider);
 
     // Personal repos have no org tier to fetch.
     if (!overridesTarget || !orgName) {
@@ -132,7 +136,7 @@ export default function RepositoryTable({
     (async () => {
       try {
         const response = await fetch(
-          `${withBase("/api/organizations/mirror-overrides")}?name=${encodeURIComponent(orgName)}`
+          `${withBase("/api/organizations/mirror-overrides")}?name=${encodeURIComponent(orgName)}&provider=${orgProvider}`
         );
         if (!response.ok) throw new Error("Failed to load organization overrides");
         const data = await response.json();
@@ -238,6 +242,7 @@ export default function RepositoryTable({
     filter.owner,
     filter.organization,
     filter.hasOverrides,
+    filter.provider,
   ].some((val) => val?.toString().trim() !== "");
 
   const columnFilters = useMemo<ColumnFiltersState>(() => {
@@ -259,8 +264,12 @@ export default function RepositoryTable({
       next.push({ id: "hasOverrides", value: filter.hasOverrides });
     }
 
+    if (filter.provider) {
+      next.push({ id: "provider", value: filter.provider });
+    }
+
     return next;
-  }, [filter.status, filter.owner, filter.organization, filter.hasOverrides]);
+  }, [filter.status, filter.owner, filter.organization, filter.hasOverrides, filter.provider]);
 
   const sorting = useMemo(() => getTableSorting(filter.sort), [filter.sort]);
 
@@ -289,6 +298,13 @@ export default function RepositoryTable({
         id: "hasOverrides",
         accessorFn: (row) =>
           hasMirrorOverrides(row.mirrorOverrides) ? "overridden" : "default",
+        filterFn: "equalsString",
+        enableGlobalFilter: false,
+      },
+      {
+        id: "provider",
+        // Rows imported before GitLab support have no provider and are GitHub's.
+        accessorFn: (row) => sourceProviderOf((row as any).provider),
         filterFn: "equalsString",
         enableGlobalFilter: false,
       },
@@ -628,11 +644,15 @@ export default function RepositoryTable({
                     href={repo.url}
                     target="_blank"
                     rel="noopener noreferrer"
-                    title="View on GitHub"
+                    title={`View on ${sourceProviderLabel(repo.provider)}`}
                     className="flex items-center justify-center gap-2"
                   >
-                    <SiGithub className="h-4 w-4 flex-shrink-0" />
-                    <span className="text-xs">GitHub</span>
+                    {sourceProviderOf(repo.provider) === "gitlab" ? (
+                      <SiGitlab className="h-4 w-4 flex-shrink-0" />
+                    ) : (
+                      <SiGithub className="h-4 w-4 flex-shrink-0" />
+                    )}
+                    <span className="text-xs">{sourceProviderLabel(repo.provider)}</span>
                   </a>
                 </Button>
                 {giteaUrl ? (
@@ -1033,9 +1053,13 @@ export default function RepositoryTable({
                             href={repo.url}
                             target="_blank"
                             rel="noopener noreferrer"
-                            title="View on GitHub"
+                            title={`View on ${sourceProviderLabel(repo.provider)}`}
                           >
-                            <SiGithub className="h-4 w-4" />
+                            {sourceProviderOf(repo.provider) === "gitlab" ? (
+                              <SiGitlab className="h-4 w-4" />
+                            ) : (
+                              <SiGithub className="h-4 w-4" />
+                            )}
                           </a>
                         </Button>
                       </div>

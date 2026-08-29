@@ -401,24 +401,28 @@ export function resolveMirrorOptions({
 export async function loadOrganizationMirrorOverrides({
   organizationName,
   userId,
+  provider = "github",
 }: {
   organizationName?: string | null;
   userId?: string;
+  /**
+   * Which forge the organization belongs to. Without it a same-named GitLab
+   * group could hand its overrides to a GitHub organization, since the lookup
+   * takes the first matching row.
+   */
+  provider?: "github" | "gitlab";
 }): Promise<MirrorOverrides | null> {
   if (!organizationName || !userId) return null;
 
   try {
     const { db, organizations } = await import("@/lib/db");
-    const { and, eq } = await import("drizzle-orm");
+    const { organizationIdentityFilter } = await import("@/lib/utils/org-scope");
 
     const [org] = await db
       .select({ mirrorOverrides: organizations.mirrorOverrides })
       .from(organizations)
       .where(
-        and(
-          eq(organizations.userId, userId),
-          eq(organizations.name, organizationName)
-        )
+        organizationIdentityFilter({ userId, name: organizationName, provider })
       )
       .limit(1);
 
@@ -447,6 +451,7 @@ export async function resolveMirrorOptionsForRepository({
   const orgOverrides = await loadOrganizationMirrorOverrides({
     organizationName: repository.organization,
     userId: config.userId,
+    provider: repository.provider ?? "github",
   });
 
   return resolveMirrorOptions({ config, repository, orgOverrides });

@@ -3,7 +3,8 @@ import { Card } from "@/components/ui/card";
 import { Button } from "@/components/ui/button";
 import { Badge } from "@/components/ui/badge";
 import { Plus, RefreshCw, Building2, Check, AlertCircle, Clock, MoreVertical, Ban, SlidersHorizontal, Trash2 } from "lucide-react";
-import { SiGithub, SiGitea } from "react-icons/si";
+import { SiGithub, SiGitea, SiGitlab } from "react-icons/si";
+import { organizationSourceUrl, sourceProviderOf, sourceProviderLabel } from "@/lib/utils/source-provider-ui";
 import type { MirrorOverrides, Organization } from "@/lib/db/schema";
 import type { FilterParams } from "@/types/filter";
 import Fuse from "fuse.js";
@@ -539,18 +540,26 @@ export function OrganizationList({
                     </Button>
                   );
                 })()}
-                <Button variant="outline" size="default" asChild className="flex-1 h-10 min-w-0">
-                  <a
-                    href={`https://github.com/${org.name}`}
-                    target="_blank"
-                    rel="noopener noreferrer"
-                    title="View on GitHub"
-                    className="flex items-center justify-center gap-2"
-                  >
-                     <SiGithub className="h-4 w-4 flex-shrink-0" />
-                     <span className="text-xs">GitHub</span>
-                  </a>
-                </Button>
+                {(() => {
+                  // GitLab group names are stored flattened, so there is no
+                  // valid group URL to link to — better no button than a 404.
+                  const sourceUrl = organizationSourceUrl(org.name, (org as any).provider);
+                  if (!sourceUrl) return null;
+                  return (
+                    <Button variant="outline" size="default" asChild className="flex-1 h-10 min-w-0">
+                      <a
+                        href={sourceUrl}
+                        target="_blank"
+                        rel="noopener noreferrer"
+                        title={`View on ${sourceProviderLabel((org as any).provider)}`}
+                        className="flex items-center justify-center gap-2"
+                      >
+                        <SiGithub className="h-4 w-4 flex-shrink-0" />
+                        <span className="text-xs">GitHub</span>
+                      </a>
+                    </Button>
+                  );
+                })()}
               </div>
             </div>
             
@@ -710,22 +719,28 @@ export function OrganizationList({
                           </>
                         )}
                       </Button>
-                      <Button 
-                        variant="ghost" 
-                        size="sm" 
-                        asChild
-                        className="rounded-none rounded-r-md"
-                      >
-                        <a
-                          href={`https://github.com/${org.name}`}
-                          target="_blank"
-                          rel="noopener noreferrer"
-                          title="View on GitHub"
-                        >
-                          <SiGithub className="h-4 w-4 mr-2" />
-                          GitHub
-                        </a>
-                      </Button>
+                      {(() => {
+                        const sourceUrl = organizationSourceUrl(org.name, (org as any).provider);
+                        if (!sourceUrl) return null;
+                        return (
+                          <Button
+                            variant="ghost"
+                            size="sm"
+                            asChild
+                            className="rounded-none rounded-r-md"
+                          >
+                            <a
+                              href={sourceUrl}
+                              target="_blank"
+                              rel="noopener noreferrer"
+                              title={`View on ${sourceProviderLabel((org as any).provider)}`}
+                            >
+                              <SiGithub className="h-4 w-4 mr-2" />
+                              GitHub
+                            </a>
+                          </Button>
+                        );
+                      })()}
                     </div>
                   );
                 })()}

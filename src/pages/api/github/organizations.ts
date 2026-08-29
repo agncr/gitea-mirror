@@ -48,9 +48,12 @@ export const GET: APIRoute = async ({ request, locals }) => {
     // Calculate repository breakdowns for each organization
     const orgsWithBreakdown = await Promise.all(
       rawOrgs.map(async (org) => {
-        // Build base conditions for this organization (without private/fork filters)
+        // Build base conditions for this organization (without private/fork filters).
+        // Scoped by provider so a GitHub and a GitLab organization of the same
+        // name do not have their repository counts added together.
         const baseConditions = [
           eq(repositories.userId, userId),
+          eq(repositories.provider, org.provider ?? "github"),
           eq(repositories.organization, org.name)
         ];
 

@@ -1,5 +1,9 @@
 import { describe, expect, test } from "bun:test";
-import { buildGithubSourceAuthPayload } from "./mirror-source-auth";
+import {
+  buildGithubSourceAuthPayload,
+  buildGitlabSourceAuthPayload,
+  buildSourceAuthPayload,
+} from "./mirror-source-auth";
 
 describe("buildGithubSourceAuthPayload", () => {
   test("uses configured owner when available", () => {
@@ -59,5 +63,70 @@ describe("buildGithubSourceAuthPayload", () => {
     });
 
     expect(result).toEqual({});
+  });
+});
+
+describe("buildGitlabSourceAuthPayload", () => {
+  test("uses the literal oauth2 username GitLab requires", () => {
+    const auth = buildGitlabSourceAuthPayload({ token: "glpat_test_token" });
+
+    expect(auth.auth_username).toBe("oauth2");
+    expect(auth.auth_password).toBe("glpat_test_token");
+    expect(auth.auth_token).toBe("glpat_test_token");
+  });
+
+  test("trims token whitespace", () => {
+    const auth = buildGitlabSourceAuthPayload({ token: "  glpat_trimmed  " });
+
+    expect(auth.auth_password).toBe("glpat_trimmed");
+  });
+
+  test("returns empty object when token is missing", () => {
+    expect(buildGitlabSourceAuthPayload({ token: "   " })).toEqual({});
+    expect(buildGitlabSourceAuthPayload({ token: null })).toEqual({});
+  });
+});
+
+describe("buildSourceAuthPayload", () => {
+  test("dispatches GitHub repositories to the GitHub credentials", () => {
+    const auth = buildSourceAuthPayload({
+      provider: "github",
+      githubToken: "ghp_token",
+      gitlabToken: "glpat_token",
+      githubOwner: "ConfiguredOwner",
+      repositoryOwner: "someone-else",
+    });
+
+    expect(auth.auth_username).toBe("ConfiguredOwner");
+    expect(auth.auth_password).toBe("ghp_token");
+  });
+
+  test("dispatches GitLab repositories to the GitLab credentials", () => {
+    const auth = buildSourceAuthPayload({
+      provider: "gitlab",
+      githubToken: "ghp_token",
+      gitlabToken: "glpat_token",
+      githubOwner: "ConfiguredOwner",
+      repositoryOwner: "acme-platform",
+    });
+
+    expect(auth.auth_username).toBe("oauth2");
+    expect(auth.auth_password).toBe("glpat_token");
+  });
+
+  test("never leaks the other forge's token", () => {
+    const auth = buildSourceAuthPayload({
+      provider: "gitlab",
+      githubToken: "ghp_should_not_appear",
+      gitlabToken: "glpat_token",
+    });
+
+    expect(JSON.stringify(auth)).not.toContain("ghp_should_not_appear");
+  });
+
+  test("returns empty object when the matching token is absent", () => {
+    expect(
+      buildSourceAuthPayload({ provider: "gitlab", githubToken: "ghp_token" }),
+    ).toEqual({});
   });
 });

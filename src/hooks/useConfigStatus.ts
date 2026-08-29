@@ -5,6 +5,9 @@ import type { ConfigApiResponse } from '@/types/config';
 
 interface ConfigStatus {
   isGitHubConfigured: boolean;
+  isGitLabConfigured: boolean;
+  /** True when at least one source forge is usable. */
+  isAnySourceConfigured: boolean;
   isGiteaConfigured: boolean;
   isFullyConfigured: boolean;
   isLoading: boolean;
@@ -31,6 +34,8 @@ export function useConfigStatus(): ConfigStatus {
   const { user } = useAuth();
   const [configStatus, setConfigStatus] = useState<ConfigStatus>({
     isGitHubConfigured: false,
+    isGitLabConfigured: false,
+    isAnySourceConfigured: false,
     isGiteaConfigured: false,
     isFullyConfigured: false,
     isLoading: true,
@@ -46,6 +51,8 @@ export function useConfigStatus(): ConfigStatus {
     if (!user?.id) {
       setConfigStatus({
         isGitHubConfigured: false,
+        isGitLabConfigured: false,
+        isAnySourceConfigured: false,
         isGiteaConfigured: false,
         isFullyConfigured: false,
         isLoading: false,
@@ -73,15 +80,27 @@ export function useConfigStatus(): ConfigStatus {
       // dashboard even though mirroring worked fine (see issue #271).
       const isGitHubConfigured = !!configResponse?.githubConfig?.token;
 
+      // GitLab needs an instance URL as well, since self-hosted is the common case.
+      const isGitLabConfigured = !!(
+        configResponse?.gitlabConfig?.token &&
+        configResponse?.gitlabConfig?.url
+      );
+
+      const isAnySourceConfigured = isGitHubConfigured || isGitLabConfigured;
+
       const isGiteaConfigured = !!(
         configResponse?.giteaConfig?.url &&
         configResponse?.giteaConfig?.token
       );
 
-      const isFullyConfigured = isGitHubConfigured && isGiteaConfigured;
+      // Any source plus the destination is enough — a GitLab-only setup is
+      // fully configured even with no GitHub token.
+      const isFullyConfigured = isAnySourceConfigured && isGiteaConfigured;
 
       setConfigStatus({
         isGitHubConfigured,
+        isGitLabConfigured,
+        isAnySourceConfigured,
         isGiteaConfigured,
         isFullyConfigured,
         isLoading: false,
@@ -118,15 +137,27 @@ export function useConfigStatus(): ConfigStatus {
       // dashboard even though mirroring worked fine (see issue #271).
       const isGitHubConfigured = !!configResponse?.githubConfig?.token;
 
+      // GitLab needs an instance URL as well, since self-hosted is the common case.
+      const isGitLabConfigured = !!(
+        configResponse?.gitlabConfig?.token &&
+        configResponse?.gitlabConfig?.url
+      );
+
+      const isAnySourceConfigured = isGitHubConfigured || isGitLabConfigured;
+
       const isGiteaConfigured = !!(
         configResponse?.giteaConfig?.url &&
         configResponse?.giteaConfig?.token
       );
 
-      const isFullyConfigured = isGitHubConfigured && isGiteaConfigured;
+      // Any source plus the destination is enough — a GitLab-only setup is
+      // fully configured even with no GitHub token.
+      const isFullyConfigured = isAnySourceConfigured && isGiteaConfigured;
 
       setConfigStatus({
         isGitHubConfigured,
+        isGitLabConfigured,
+        isAnySourceConfigured,
         isGiteaConfigured,
         isFullyConfigured,
         isLoading: false,
@@ -139,6 +170,8 @@ export function useConfigStatus(): ConfigStatus {
     } catch (error) {
       setConfigStatus({
         isGitHubConfigured: false,
+        isGitLabConfigured: false,
+        isAnySourceConfigured: false,
         isGiteaConfigured: false,
         isFullyConfigured: false,
         isLoading: false,

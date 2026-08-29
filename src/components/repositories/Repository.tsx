@@ -51,6 +51,7 @@ import { useLiveRefresh } from "@/hooks/useLiveRefresh";
 import { useConfigStatus } from "@/hooks/useConfigStatus";
 import { useNavigation } from "@/components/layout/MainLayout";
 import { withBase } from "@/lib/base-path";
+import { sourceProviderOf } from "@/lib/utils/source-provider-ui";
 
 const REPOSITORY_SORT_OPTIONS = [
   { value: "imported-desc", label: "Recently Imported" },
@@ -66,7 +67,7 @@ export default function Repository() {
   const [isInitialLoading, setIsInitialLoading] = useState(true);
   const { user } = useAuth();
   const { registerRefreshCallback, isLiveEnabled } = useLiveRefresh();
-  const { isGitHubConfigured, isFullyConfigured, autoMirrorStarred, githubOwner } = useConfigStatus();
+  const { isAnySourceConfigured, isGitHubConfigured, isGitLabConfigured, isFullyConfigured, autoMirrorStarred, githubOwner } = useConfigStatus();
   const { navigationKey } = useNavigation();
   const { filter, setFilter } = useFilterParams({
     searchTerm: "",
@@ -124,7 +125,7 @@ export default function Repository() {
     if (!user?.id) return;
 
     // Don't fetch repositories if GitHub is not configured or still loading config
-    if (!isGitHubConfigured) {
+    if (!isAnySourceConfigured) {
       setIsInitialLoading(false);
       return false;
     }
@@ -163,7 +164,7 @@ export default function Repository() {
         setIsInitialLoading(false);
       }
     }
-  }, [user?.id, isGitHubConfigured]); // Only depend on user.id, not entire user object
+  }, [user?.id, isAnySourceConfigured]); // Only depend on user.id, not entire user object
 
   useEffect(() => {
     // Reset loading state when component becomes active
@@ -174,7 +175,7 @@ export default function Repository() {
   // Register with global live refresh system
   useEffect(() => {
     // Only register for live refresh if GitHub is configured
-    if (!isGitHubConfigured) {
+    if (!isAnySourceConfigured) {
       return;
     }
 
@@ -183,7 +184,7 @@ export default function Repository() {
     });
 
     return unregister;
-  }, [registerRefreshCallback, fetchRepositories, isGitHubConfigured]);
+  }, [registerRefreshCallback, fetchRepositories, isAnySourceConfigured]);
 
   const handleRefresh = async () => {
     const success = await fetchRepositories(false); // Manual refresh, show loading skeleton
@@ -809,8 +810,13 @@ export default function Repository() {
     const normalizedFullName = `${trimmedOwner}/${trimmedRepo}`.toLowerCase();
 
     if (!force) {
+      // GitHub-only: this manual add path creates GitHub rows, so a same-named
+      // GitLab repository is a different repository and must not block it with
+      // a misleading "already exists".
       const duplicateRepo = repositories.find(
-        (existing) => existing.normalizedFullName?.toLowerCase() === normalizedFullName
+        (existing) =>
+          sourceProviderOf((existing as any).provider) === "github" &&
+          existing.normalizedFullName?.toLowerCase() === normalizedFullName
       );
 
       if (duplicateRepo) {
@@ -1028,7 +1034,7 @@ export default function Repository() {
 
   // Check if any filters are active
   const hasActiveFilters = !!(filter.owner || filter.organization || filter.status);
-  const activeFilterCount = [filter.owner, filter.organization, filter.status, filter.hasOverrides].filter(Boolean).length;
+  const activeFilterCount = [filter.owner, filter.organization, filter.status, filter.hasOverrides, filter.provider].filter(Boolean).length;
 
   // Clear all filters
   const clearFilters = () => {
@@ -1038,6 +1044,7 @@ export default function Repository() {
       organization: "",
       owner: "",
       hasOverrides: "",
+      provider: "",
       sort: filter.sort || "imported-desc",
     });
   };
@@ -1361,6 +1368,28 @@ export default function Repository() {
               </SelectContent>
             </Select>
 
+            {/* Only worth showing once both forges are actually in use. */}
+            {isGitLabConfigured && isGitHubConfigured && (
+              <Select
+                value={filter.provider || "all"}
+                onValueChange={(value) =>
+                  setFilter((prev) => ({
+                    ...prev,
+                    provider: value === "all" ? "" : (value as "github" | "gitlab"),
+                  }))
+                }
+              >
+                <SelectTrigger className="w-[150px] h-10">
+                  <SelectValue placeholder="All sources" />
+                </SelectTrigger>
+                <SelectContent>
+                  <SelectItem value="all">All sources</SelectItem>
+                  <SelectItem value="github">GitHub</SelectItem>
+                  <SelectItem value="gitlab">GitLab</SelectItem>
+                </SelectContent>
+              </Select>
+            )}
+
             <Select
               value={filter.sort || "imported-desc"}
               onValueChange={(value) =>
@@ -1612,11 +1641,11 @@ export default function Repository() {
         </div>
       )}
 
-      {!isGitHubConfigured ? (
+      {!isAnySourceConfigured ? (
         <div className="flex flex-col items-center justify-center p-8 border border-dashed rounded-md">
-          <h3 className="text-xl font-semibold mb-2">GitHub Not Configured</h3>
+          <h3 className="text-xl font-semibold mb-2">No Source Configured</h3>
           <p className="text-muted-foreground text-center mb-4">
-            You need to configure your GitHub credentials before you can fetch and mirror repositories.
+            Connect GitHub or GitLab before you can fetch and mirror repositories.
           </p>
           <Button
             variant="default"

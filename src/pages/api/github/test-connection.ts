@@ -1,9 +1,16 @@
 import type { APIRoute } from "astro";
 import { createGitHubClient } from "@/lib/github";
 import { createSecureErrorResponse } from "@/lib/utils";
+import { requireAuthenticatedUserId } from "@/lib/auth-guards";
 
-export const POST: APIRoute = async ({ request }) => {
+export const POST: APIRoute = async ({ request, locals }) => {
   try {
+    // No caller-supplied URL here (the endpoint comes from GH_API_URL), so this
+    // is not an SSRF vector — but the route still forwards a token on the
+    // caller's behalf and has no reason to be anonymous.
+    const authResult = await requireAuthenticatedUserId({ request, locals });
+    if ("response" in authResult) return authResult.response;
+
     const body = await request.json();
     const { token, username } = body;
 
