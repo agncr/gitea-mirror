@@ -15,6 +15,8 @@ import { createMirrorJob } from "@/lib/helpers";
 import { createSecureErrorResponse } from "@/lib/utils";
 import { getDecryptedGitHubToken } from "@/lib/utils/config-encryption";
 import { requireAuthenticatedUserId } from "@/lib/auth-guards";
+import { configuredSourceProviders } from "@/lib/utils/config-encryption";
+const hasAnySourceToken = (config: any) => configuredSourceProviders(config).length > 0;
 
 export const POST: APIRoute = async ({ request, locals }) => {
   try {
@@ -56,7 +58,7 @@ export const POST: APIRoute = async ({ request, locals }) => {
 
     const config = configResult[0];
 
-    if (!config || !config.githubConfig.token || !config.giteaConfig?.token) {
+    if (!config || !hasAnySourceToken(config) || !config.giteaConfig?.token) {
       return new Response(
         JSON.stringify({ error: "Missing GitHub or Gitea configuration." }),
         { status: 400, headers: { "Content-Type": "application/json" } }
@@ -84,7 +86,7 @@ export const POST: APIRoute = async ({ request, locals }) => {
     // Start background retry with parallel processing
     setTimeout(async () => {
       // Create a single Octokit instance to be reused if needed with rate limit tracking
-      const decryptedToken = config.githubConfig.token
+      const decryptedToken = config.githubConfig?.token
         ? getDecryptedGitHubToken(config)
         : null;
       const githubUsername = config.githubConfig?.owner || undefined;
@@ -143,14 +145,20 @@ export const POST: APIRoute = async ({ request, locals }) => {
             await syncGiteaRepo({ config, repository: repoData });
             console.log(`Synced existing repo: ${repo.name}`);
           } else {
-            // If the repository doesn't exist, mirror it
-            if (!config.githubConfig.token) {
+            // If the repository doesn't exist, mirror it. GitLab repositories
+            // mirror code through Gitea's migration and need no Octokit; only
+            // GitHub rows require the client.
+            const isGitlabRepo = (repoData.provider ?? "github") === "gitlab";
+
+            if (!isGitlabRepo && !config.githubConfig?.token) {
               throw new Error("GitHub token is missing.");
             }
 
-            if (!octokit) {
+            if (!isGitlabRepo && !octokit) {
               throw new Error("Octokit client is not initialized.");
             }
+
+            const repoOctokit = isGitlabRepo ? null : octokit;
 
             console.log(`Importing repo: ${repo.name} to owner: ${owner}`);
 
@@ -166,7 +174,7 @@ export const POST: APIRoute = async ({ request, locals }) => {
             if (shouldUseOrgMirror) {
               await mirrorGitHubOrgRepoToGiteaOrg({
                 config,
-                octokit,
+                octokit: repoOctokit,
                 orgName: owner,
                 repository: {
                   ...repoData,
@@ -176,7 +184,7 @@ export const POST: APIRoute = async ({ request, locals }) => {
             } else {
               await mirrorGithubRepoToGitea({
                 config,
-                octokit,
+                octokit: repoOctokit,
                 repository: {
                   ...repoData,
                   status: repoStatusEnum.parse("imported"),

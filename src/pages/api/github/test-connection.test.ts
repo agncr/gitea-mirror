@@ -1,5 +1,12 @@
 import { describe, test, expect, mock, beforeEach, afterEach } from "bun:test";
 
+/**
+ * The route requires authentication: it forwards a caller-supplied token to
+ * GitHub, so it must not be callable anonymously. These cases exercise the
+ * connection logic, so they always present a session.
+ */
+const AUTHED_LOCALS = { session: { userId: "user-1" } };
+
 // createGitHubClient returns this stub. Tests mutate `getAuthenticatedImpl`
 // to steer the behavior without re-calling mock.module (which is fragile
 // once the route module has already captured a live binding).
@@ -55,7 +62,7 @@ describe("GitHub Test Connection API", () => {
       body: JSON.stringify({})
     });
 
-    const response = await POST({ request } as any);
+    const response = await POST({ request, locals: AUTHED_LOCALS } as any);
 
     expect(response.status).toBe(400);
 
@@ -75,7 +82,7 @@ describe("GitHub Test Connection API", () => {
       })
     });
 
-    const response = await POST({ request } as any);
+    const response = await POST({ request, locals: AUTHED_LOCALS } as any);
 
     expect(response.status).toBe(200);
 
@@ -101,7 +108,7 @@ describe("GitHub Test Connection API", () => {
       })
     });
 
-    const response = await POST({ request } as any);
+    const response = await POST({ request, locals: AUTHED_LOCALS } as any);
 
     expect(response.status).toBe(400);
 
@@ -124,7 +131,7 @@ describe("GitHub Test Connection API", () => {
       })
     });
 
-    const response = await POST({ request } as any);
+    const response = await POST({ request, locals: AUTHED_LOCALS } as any);
 
     expect(response.status).toBe(500);
 
@@ -133,5 +140,20 @@ describe("GitHub Test Connection API", () => {
     // It sanitizes error messages for security, so we expect the generic message
     expect(data.error).toBeDefined();
     expect(data.error).toBe("An internal server error occurred");
+  });
+});
+
+describe("GitHub Test Connection API — authentication", () => {
+  test("rejects an anonymous caller instead of using its token", async () => {
+    const request = new Request("http://localhost/api/github/test-connection", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ token: "ghp_attacker_supplied" }),
+    });
+
+    // No `locals.session`: this is what an unauthenticated request looks like.
+    const response = await POST({ request, locals: {} } as any);
+
+    expect(response.status).toBe(401);
   });
 });

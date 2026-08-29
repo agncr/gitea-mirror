@@ -18,6 +18,7 @@ When environment variables are set:
 - [Core Configuration](#core-configuration)
 - [HTTPS / TLS](#https--tls)
 - [GitHub Configuration](#github-configuration)
+- [GitLab Configuration](#gitlab-configuration)
 - [Gitea Configuration](#gitea-configuration)
 - [Mirror Options](#mirror-options)
 - [Automation Configuration](#automation-configuration)
@@ -125,6 +126,51 @@ Standard GitHub Enterprise Cloud on `github.com` works with the default — no o
 |----------|-------------|---------|---------|
 | `SKIP_STARRED_ISSUES` | Enable lightweight mode for starred repos (skip issues) | `false` | `true`, `false` |
 | `AUTO_MIRROR_STARRED` | Automatically mirror starred repos during scheduled syncs and "Mirror All". When `false`, starred repos are imported for browsing but must be mirrored individually. | `false` | `true`, `false` |
+
+## GitLab Configuration
+
+Settings for mirroring a GitLab group. GitLab is an **optional second source**:
+you can configure GitHub only, GitLab only, or both at the same time.
+
+Setting `GITLAB_TOKEN` is what activates the source.
+
+| Variable | Description | Default | Options |
+|----------|-------------|---------|---------|
+| `GITLAB_URL` | GitLab instance URL. Change this for a self-hosted GitLab. | `https://gitlab.com` | e.g. `https://gitlab.example.com` |
+| `GITLAB_TOKEN` | GitLab personal access token (requires `read_api` and `read_repository` scopes) | - | - |
+| `GITLAB_USERNAME` | Your GitLab username. Optional; used for display and to resolve group roles. | - | - |
+| `GITLAB_GROUPS` | Comma-separated group paths to mirror, e.g. `acme,acme/platform` | - | - |
+| `GITLAB_INCLUDE_SUBGROUPS` | Also mirror projects from nested subgroups | `true` | `true`, `false` |
+| `GITLAB_INCLUDE_OWN_PROJECTS` | Also mirror projects in your personal namespace | `false` | `true`, `false` |
+| `GITLAB_INCLUDE_FORKS` | Include forked projects | `true` | `true`, `false` |
+| `GITLAB_INCLUDE_ARCHIVED` | Include archived projects | `false` | `true`, `false` |
+| `GITLAB_PRIVATE_REPOSITORIES` | Include private projects (GitLab's `internal` visibility counts as private) | `true` | `true`, `false` |
+| `GITLAB_PUBLIC_REPOSITORIES` | Include public projects | `true` | `true`, `false` |
+
+### Nested subgroups
+
+Gitea has no nested organizations, so a GitLab subgroup path is flattened into a
+single organization name at import time:
+
+| GitLab group | Gitea organization |
+|--------------|--------------------|
+| `acme` | `acme` |
+| `acme/platform` | `acme-platform` |
+| `acme/platform/backend` | `acme-platform-backend` |
+
+Names longer than Gitea's 40-character limit are truncated with a short
+deterministic suffix, so a project keeps the same name across syncs.
+
+### Scope of GitLab support
+
+GitLab mirroring currently covers **repository code**, plus the wiki when
+`MIRROR_WIKI` is enabled (Gitea clones it as part of the migration).
+
+Not yet mirrored from GitLab: issues, merge requests, releases, labels and
+milestones. Those options stay in effect for GitHub repositories; GitLab
+repositories simply skip them. Force-push detection and pre-sync backups are
+likewise GitHub-only, so a GitLab mirror behaves as if the backup strategy were
+disabled.
 
 ## Gitea Configuration
 
@@ -280,7 +326,7 @@ Configure automatic cleanup of old events and data.
 | Variable | Description | Default | Options |
 |----------|-------------|---------|---------|
 | `CLEANUP_DELETE_FROM_GITEA` | Apply the orphaned-repo action on the Gitea side too. When `false` (default), cleanup only updates gitea-mirror's own database (orphans are marked archived or removed from the repo list) and the Gitea/Forgejo copies are left untouched | `false` | `true`, `false` |
-| `CLEANUP_DELETE_IF_NOT_IN_GITHUB` | Delete repos not found in GitHub (automatically enables cleanup) | `true` | `true`, `false` |
+| `CLEANUP_DELETE_IF_NOT_IN_GITHUB` | Delete repos no longer present in their source. Despite the name this applies per source: GitHub repos are checked against GitHub, GitLab projects against GitLab. Automatically enables cleanup. | `true` | `true`, `false` |
 | `CLEANUP_ORPHANED_REPO_ACTION` | Action for orphaned repositories. **Note**: `archive` is recommended to preserve backups | `archive` | `skip`, `archive`, `delete` |
 | `CLEANUP_DRY_RUN` | Test mode without actual deletion | `false` | `true`, `false` |
 | `CLEANUP_PROTECTED_REPOS` | Comma-separated list of protected repository names | - | Comma-separated strings |

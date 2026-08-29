@@ -8,6 +8,8 @@ import type { SyncRepoResponse } from "@/types/sync";
 import { processWithResilience } from "@/lib/utils/concurrency";
 import { createSecureErrorResponse } from "@/lib/utils";
 import { requireAuthenticatedUserId } from "@/lib/auth-guards";
+import { configuredSourceProviders } from "@/lib/utils/config-encryption";
+const hasAnySourceToken = (config: any) => configuredSourceProviders(config).length > 0;
 
 export const POST: APIRoute = async ({ request, locals }) => {
   try {
@@ -49,7 +51,7 @@ export const POST: APIRoute = async ({ request, locals }) => {
 
     const config = configResult[0];
 
-    if (!config || !config.githubConfig.token) {
+    if (!config || !hasAnySourceToken(config)) {
       return new Response(
         JSON.stringify({ error: "Config missing for the user or token." }),
         { status: 400, headers: { "Content-Type": "application/json" } }

@@ -11,6 +11,9 @@ import { processWithResilience } from "@/lib/utils/concurrency";
 import { v4 as uuidv4 } from "uuid";
 import { getDecryptedGitHubToken } from "@/lib/utils/config-encryption";
 import { requireAuthenticatedUserId } from "@/lib/auth-guards";
+import { configuredSourceProviders } from "@/lib/utils/config-encryption";
+import { missingProviderCredentials } from "@/lib/utils/source-credentials";
+const hasAnySourceToken = (config: any) => configuredSourceProviders(config).length > 0;
 
 export const POST: APIRoute = async ({ request, locals }) => {
   try {
@@ -52,7 +55,7 @@ export const POST: APIRoute = async ({ request, locals }) => {
 
     const config = configResult[0];
 
-    if (!config || !config.githubConfig.token) {
+    if (!config || !hasAnySourceToken(config)) {
       return new Response(
         JSON.stringify({ error: "Config missing for the user or token." }),
         { status: 400, headers: { "Content-Type": "application/json" } }
@@ -77,16 +80,40 @@ export const POST: APIRoute = async ({ request, locals }) => {
       );
     }
 
+    // Validate credentials for the providers actually present in this batch.
+    // Checking only "some source is configured" would accept a organization whose
+    // forge has no token and fail later inside the async job, after the caller
+    // was already told the work had started.
+    const missingProviders = missingProviderCredentials(
+      orgs,
+      configuredSourceProviders(config as any)
+    );
+    if (missingProviders.length > 0) {
+      return new Response(
+        JSON.stringify({
+          error: `Missing credentials for: ${missingProviders.join(", ")}`,
+        }),
+        { status: 400, headers: { "Content-Type": "application/json" } }
+      );
+    }
+
     // Fire async mirroring without blocking response, using parallel processing with resilience
     setTimeout(async () => {
-      if (!config.githubConfig.token) {
-        throw new Error("GitHub token is missing in config.");
-      }
-
-      // Create a single Octokit instance to be reused with rate limit tracking
-      const decryptedToken = getDecryptedGitHubToken(config);
-      const githubUsername = config.githubConfig?.owner || undefined;
-      const octokit = createGitHubClient(decryptedToken, userId, githubUsername);
+      // Built once and only when a GitHub organization is actually in the
+      // batch: a GitLab-only setup has no GitHub token to decrypt.
+      let octokit: ReturnType<typeof createGitHubClient> | null = null;
+      const ensureOctokit = () => {
+        if (octokit) return octokit;
+        if (!config.githubConfig?.token) {
+          throw new Error("GitHub token is missing in config.");
+        }
+        octokit = createGitHubClient(
+          getDecryptedGitHubToken(config),
+          userId,
+          config.githubConfig?.owner || undefined,
+        );
+        return octokit;
+      };
 
       // Define the concurrency limit - adjust based on API rate limits
       // Using a lower concurrency for organizations since each org might contain many repos
@@ -114,7 +141,7 @@ export const POST: APIRoute = async ({ request, locals }) => {
           // Mirror the organization
           await mirrorGitHubOrgToGitea({
             config,
-            octokit,
+            octokit: orgData.provider === "gitlab" ? null : ensureOctokit(),
             organization: orgData,
           });
 

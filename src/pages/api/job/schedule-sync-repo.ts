@@ -10,6 +10,8 @@ import type {
 import { createSecureErrorResponse } from "@/lib/utils";
 import { getNextScheduledRun, normalizeTimezone } from "@/lib/utils/schedule-utils";
 import { requireAuthenticatedUserId } from "@/lib/auth-guards";
+import { configuredSourceProviders } from "@/lib/utils/config-encryption";
+const hasAnySourceToken = (config: any) => configuredSourceProviders(config).length > 0;
 
 export const POST: APIRoute = async ({ request, locals }) => {
   try {
@@ -30,7 +32,7 @@ export const POST: APIRoute = async ({ request, locals }) => {
 
     const config = configResult[0];
 
-    if (!config || !config.githubConfig.token) {
+    if (!config || !hasAnySourceToken(config)) {
       return new Response(
         JSON.stringify({
           success: false,

@@ -2,20 +2,22 @@
  * Maps between UI config structure and database schema structure
  */
 
-import type { 
-  GitHubConfig, 
+import type {
+  GitHubConfig,
+  GitLabConfig,
   GiteaConfig,
-  MirrorOptions, 
+  MirrorOptions,
   AdvancedOptions,
-  SaveConfigApiRequest 
+  SaveConfigApiRequest
 } from "@/types/config";
 import { z } from "zod";
-import { githubConfigSchema, giteaConfigSchema, scheduleConfigSchema, cleanupConfigSchema } from "@/lib/db/schema";
+import { githubConfigSchema, gitlabConfigSchema, giteaConfigSchema, scheduleConfigSchema, cleanupConfigSchema } from "@/lib/db/schema";
 import { parseInterval } from "@/lib/utils/duration-parser";
 import { buildClockCronExpression, normalizeTimezone, parseClockCronExpression } from "@/lib/utils/schedule-utils";
 
 // Use the actual database schema types
 type DbGitHubConfig = z.infer<typeof githubConfigSchema>;
+type DbGitlabConfig = z.infer<typeof gitlabConfigSchema>;
 type DbGiteaConfig = z.infer<typeof giteaConfigSchema>;
 type DbScheduleConfig = z.infer<typeof scheduleConfigSchema>;
 type DbCleanupConfig = z.infer<typeof cleanupConfigSchema>;
@@ -47,6 +49,107 @@ function normalizeOrgList(orgs: string[] | undefined): string[] {
     result.push(trimmed);
   }
   return result;
+}
+
+/**
+ * Trim, drop blanks, and de-duplicate GitLab group paths case-insensitively,
+ * preserving first-seen casing. Leading/trailing slashes are stripped so
+ * "/acme/platform/" and "acme/platform" are the same group.
+ */
+export function normalizeGitlabGroupList(groups: string[] | undefined): string[] {
+  if (!Array.isArray(groups)) return [];
+  const seen = new Set<string>();
+  const result: string[] = [];
+  for (const group of groups) {
+    if (typeof group !== "string") continue;
+    const trimmed = group.trim().replace(/^\/+|\/+$/g, "");
+    if (!trimmed) continue;
+    const key = trimmed.toLowerCase();
+    if (seen.has(key)) continue;
+    seen.add(key);
+    result.push(trimmed);
+  }
+  return result;
+}
+
+/**
+ * What a config save intends to do with the GitLab source. Three distinct
+ * cases, which a plain nullable value cannot express:
+ *
+ * - `keep`: the key was absent. A client that predates GitLab support, or a
+ *   save from an unrelated section, must not wipe an env-provisioned source
+ *   (the same preservation rule as issue #338).
+ * - `remove`: the caller sent an explicit `null` — a deliberate disconnect.
+ *   Without this, a user could never drop a leaked token.
+ * - `set`: a configuration to validate and store.
+ */
+export type GitlabConfigIntent =
+  | { action: "keep" }
+  | { action: "remove" }
+  | { action: "set"; value: GitLabConfig };
+
+/**
+ * Classify the `gitlabConfig` field of a save request.
+ *
+ * `undefined` and `null` mean opposite things here, so this deliberately does
+ * not collapse them into one falsy check.
+ */
+export function resolveGitlabConfigIntent(raw: unknown): GitlabConfigIntent {
+  if (raw === undefined) return { action: "keep" };
+  if (raw === null) return { action: "remove" };
+  return { action: "set", value: raw as GitLabConfig };
+}
+
+/**
+ * Maps the UI GitLab config to the stored shape.
+ *
+ * Only handles the `set` case; callers use {@link resolveGitlabConfigIntent}
+ * to tell keep/remove/set apart first.
+ */
+export function mapUiToDbGitlabConfig(
+  uiGitlab: GitLabConfig | null | undefined,
+  existing?: DbGitlabConfig | null,
+): DbGitlabConfig | null {
+  if (!uiGitlab) {
+    return existing ?? null;
+  }
+
+  return {
+    url: uiGitlab.url?.trim() || "https://gitlab.com",
+    // An empty token from the UI means "keep the stored one"; the config API
+    // performs the same preservation for GitHub/Gitea tokens.
+    token: uiGitlab.token || existing?.token || "",
+    username: uiGitlab.username?.trim() || undefined,
+    groups: normalizeGitlabGroupList(uiGitlab.groups),
+    includeSubgroups: uiGitlab.includeSubgroups ?? true,
+    includeOwnProjects: uiGitlab.includeOwnProjects ?? false,
+    includeForks: uiGitlab.includeForks ?? true,
+    includeArchived: uiGitlab.includeArchived ?? false,
+    includePrivate: uiGitlab.includePrivate ?? true,
+    includePublic: uiGitlab.includePublic ?? true,
+  };
+}
+
+/**
+ * Maps the stored GitLab config to the UI shape. Returns null when GitLab was
+ * never configured, which the UI renders as an empty, collapsed source card.
+ */
+export function mapDbToUiGitlabConfig(dbConfig: any): GitLabConfig | null {
+  const stored = dbConfig?.gitlabConfig;
+  if (!stored) return null;
+
+  return {
+    url: stored.url || "https://gitlab.com",
+    token: stored.token || "",
+    username: stored.username || undefined,
+    groups: normalizeGitlabGroupList(stored.groups),
+    includeSubgroups: stored.includeSubgroups ?? true,
+    includeOwnProjects: stored.includeOwnProjects ?? false,
+    includeForks: stored.includeForks ?? true,
+    includeArchived: stored.includeArchived ?? false,
+    includePrivate: stored.includePrivate ?? true,
+    includePublic: stored.includePublic ?? true,
+  };
 }
 
 /**

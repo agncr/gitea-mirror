@@ -1,6 +1,8 @@
 import type { APIRoute } from 'astro';
 import { httpGet, HttpError } from '@/lib/http-client';
 import { createSecureErrorResponse } from '@/lib/utils';
+import { requireAuthenticatedUserId } from '@/lib/auth-guards';
+import { validateOutboundUrl } from '@/lib/utils/outbound-url';
 
 // Forgejo reports `15.0.0+gitea-1.22.0`; pure Gitea reports just `1.22.0`.
 // Forgejo < 15.0.0 has a known bug where pull-mirror credentials sent via
@@ -21,8 +23,13 @@ function parseServerInfo(versionString: string) {
   return { type: 'gitea' as const, version: versionString, raw: versionString, hasMirrorCredBug: false };
 }
 
-export const POST: APIRoute = async ({ request }) => {
+export const POST: APIRoute = async ({ request, locals }) => {
   try {
+    // The server fetches a caller-supplied URL here, so authentication is
+    // required: unauthenticated, this endpoint is an SSRF primitive.
+    const authResult = await requireAuthenticatedUserId({ request, locals });
+    if ("response" in authResult) return authResult.response;
+
     const body = await request.json();
     const { url, token, username } = body;
 
@@ -37,6 +44,17 @@ export const POST: APIRoute = async ({ request }) => {
           headers: {
             'Content-Type': 'application/json',
           },
+        }
+      );
+    }
+
+    const urlCheck = validateOutboundUrl(url);
+    if (!urlCheck.ok) {
+      return new Response(
+        JSON.stringify({ success: false, message: urlCheck.reason }),
+        {
+          status: 400,
+          headers: { 'Content-Type': 'application/json' },
         }
       );
     }

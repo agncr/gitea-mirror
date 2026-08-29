@@ -11,9 +11,102 @@ import {
 } from "@/lib/github";
 import { jsonResponse, createSecureErrorResponse } from "@/lib/utils";
 import { mergeGitReposPreferStarred, calcBatchSizeForInsert } from "@/lib/repo-utils";
-import { getDecryptedGitHubToken } from "@/lib/utils/config-encryption";
+import {
+  getDecryptedGitHubToken,
+  getDecryptedGitLabToken,
+  configuredSourceProviders,
+} from "@/lib/utils/config-encryption";
 import { requireAuthenticatedUserId } from "@/lib/auth-guards";
 import { isMirrorableGitHubRepo } from "@/lib/repo-eligibility";
+import {
+  createGitlabClient,
+  getGitlabGroups,
+  getGitlabRepositories,
+  testGitlabConnection,
+} from "@/lib/gitlab";
+import type { GitRepo } from "@/types/Repository";
+import type { GitOrg } from "@/types/organizations";
+import type { RepoProvider } from "@/lib/db/schema";
+
+interface SourceImport {
+  repos: GitRepo[];
+  orgs: GitOrg[];
+  /**
+   * Organizations/groups the source could not read. Each carries its own
+   * provider: merging the lists across sources and stamping one provider onto
+   * all of them would file an unreachable GitLab group as a GitHub
+   * organization, where it can collide with a real one and never recover.
+   */
+  failedOrgs: { name: string; avatarUrl: string; reason: string; provider: RepoProvider }[];
+  /** Repos the source exposes but that cannot be mirrored (disabled on GitHub). */
+  skippedCount: number;
+}
+
+async function importFromGithub(
+  config: any,
+  userId: string,
+  /** Normalized names of ignored GitHub organizations only. */
+  ignoredGithubOrgNames: Set<string>,
+): Promise<SourceImport> {
+  const decryptedToken = getDecryptedGitHubToken(config);
+  const githubUsername = config.githubConfig?.owner || undefined;
+  const octokit = createGitHubClient(decryptedToken, userId, githubUsername);
+
+  const [basicAndForkedRepos, starredRepos, orgResult] = await Promise.all([
+    getGithubRepositories({ octokit, config }),
+    config.githubConfig?.includeStarred
+      ? getGithubStarredRepositories({ octokit, config })
+      : Promise.resolve([]),
+    getGithubOrganizations({ octokit, config, skipOrgNames: ignoredGithubOrgNames }),
+  ]);
+
+  // Merge and de-duplicate by fullName, preferring starred variant when duplicated
+  const allRepos = mergeGitReposPreferStarred(basicAndForkedRepos, starredRepos);
+  const mirrorable = allRepos.filter(isMirrorableGitHubRepo);
+
+  return {
+    repos: mirrorable,
+    orgs: orgResult.organizations,
+    failedOrgs: orgResult.failedOrgs.map((o) => ({ ...o, provider: "github" as const })),
+    skippedCount: allRepos.length - mirrorable.length,
+  };
+}
+
+async function importFromGitlab(config: any): Promise<SourceImport> {
+  const client = createGitlabClient({
+    url: config.gitlabConfig.url,
+    token: getDecryptedGitLabToken(config),
+  });
+
+  const repos = await getGitlabRepositories({ client, config });
+
+  // The account id is only needed to resolve group access levels; a failure
+  // there costs a nicer membership badge, not the import.
+  let currentUserId: number | undefined;
+  try {
+    const account = await testGitlabConnection({
+      url: config.gitlabConfig.url,
+      token: getDecryptedGitLabToken(config),
+    });
+    currentUserId = account.id;
+  } catch {
+    // Fall through with no id; roles default to "member".
+  }
+
+  const { organizations: orgs, failedGroups } = await getGitlabGroups({
+    client,
+    config,
+    repositories: repos,
+    currentUserId,
+  });
+
+  return {
+    repos,
+    orgs,
+    failedOrgs: failedGroups.map((g) => ({ ...g, provider: "gitlab" as const })),
+    skippedCount: 0,
+  };
+}
 
 export const POST: APIRoute = async ({ request, locals }) => {
   const authResult = await requireAuthenticatedUserId({ request, locals });
@@ -37,41 +130,68 @@ export const POST: APIRoute = async ({ request, locals }) => {
       });
     }
 
-    if (!config.githubConfig?.token) {
+    const sourceProviders = configuredSourceProviders(config as any);
+    if (sourceProviders.length === 0) {
       return jsonResponse({
-        data: { error: "GitHub token is missing in config" },
+        data: { error: "No source token is configured. Add a GitHub or GitLab token first." },
         status: 400,
       });
     }
 
-    // Decrypt the GitHub token before using it
-    const decryptedToken = getDecryptedGitHubToken(config);
-    const githubUsername = config.githubConfig?.owner || undefined;
-    const octokit = createGitHubClient(decryptedToken, userId, githubUsername);
-
     // Load ignored orgs from the DB so we can skip them during import
     const ignoredOrgRows = await db
-      .select({ normalizedName: organizations.normalizedName })
+      .select({
+        normalizedName: organizations.normalizedName,
+        provider: organizations.provider,
+      })
       .from(organizations)
       .where(and(eq(organizations.userId, userId), eq(organizations.status, "ignored")));
-    const ignoredOrgNames = new Set(ignoredOrgRows.map((o) => o.normalizedName));
 
-    // Fetch GitHub data in parallel
-    const [basicAndForkedRepos, starredRepos, orgResult] = await Promise.all([
-      getGithubRepositories({ octokit, config }),
-      config.githubConfig?.includeStarred
-        ? getGithubStarredRepositories({ octokit, config })
-        : Promise.resolve([]),
-      getGithubOrganizations({ octokit, config, skipOrgNames: ignoredOrgNames }),
-    ]);
-    const { organizations: gitOrgs, failedOrgs } = orgResult;
+    // Keyed by provider: ignoring GitHub "acme" must not also suppress an
+    // unrelated GitLab group of the same name.
+    const ignoredOrgKeys = new Set(
+      ignoredOrgRows.map((o) => `${o.provider}:${o.normalizedName}`)
+    );
+    // getGithubOrganizations only ever sees GitHub organizations, so it takes
+    // bare names — filtered to this provider so GitLab entries cannot leak in.
+    const ignoredGithubOrgNames = new Set(
+      ignoredOrgRows
+        .filter((o) => o.provider === "github")
+        .map((o) => o.normalizedName)
+    );
 
-    // Merge and de-duplicate by fullName, preferring starred variant when duplicated
-    const allGithubRepos = mergeGitReposPreferStarred(basicAndForkedRepos, starredRepos);
-    const mirrorableGithubRepos = allGithubRepos.filter(isMirrorableGitHubRepo);
+    // Import every configured source. One failing source is reported but does
+    // not discard what the others found.
+    const sourceErrors: string[] = [];
+    const imports: SourceImport[] = [];
+    for (const provider of sourceProviders) {
+      try {
+        imports.push(
+          provider === "gitlab"
+            ? await importFromGitlab(config)
+            : await importFromGithub(config, userId, ignoredGithubOrgNames)
+        );
+      } catch (sourceError) {
+        const message = sourceError instanceof Error ? sourceError.message : String(sourceError);
+        console.error(`[Sync] Failed to import from ${provider}: ${message}`);
+        sourceErrors.push(`${provider}: ${message}`);
+      }
+    }
+
+    if (imports.length === 0) {
+      return jsonResponse({
+        data: { error: `Import failed for every configured source. ${sourceErrors.join("; ")}` },
+        status: 502,
+      });
+    }
+
+    const discoveredRepos = imports.flatMap((i) => i.repos);
+    const gitOrgs = imports.flatMap((i) => i.orgs);
+    const failedOrgs = imports.flatMap((i) => i.failedOrgs);
+    const skippedDisabledRepositories = imports.reduce((sum, i) => sum + i.skippedCount, 0);
 
     // Prepare full list of repos and orgs
-    const newRepos = mirrorableGithubRepos.map((repo) => ({
+    const newRepos = discoveredRepos.map((repo) => ({
       id: uuidv4(),
       userId,
       configId: config.id,
@@ -80,6 +200,7 @@ export const POST: APIRoute = async ({ request, locals }) => {
       normalizedFullName: repo.fullName.toLowerCase(),
       url: repo.url,
       cloneUrl: repo.cloneUrl,
+      provider: repo.provider,
       owner: repo.owner,
       organization: repo.organization ?? null,
       mirroredLocation: repo.mirroredLocation || "",
@@ -111,6 +232,7 @@ export const POST: APIRoute = async ({ request, locals }) => {
       configId: config.id,
       name: org.name,
       normalizedName: org.name.toLowerCase(),
+      provider: org.provider,
       avatarUrl: org.avatarUrl,
       membershipRole: org.membershipRole,
       isIncluded: false,
@@ -127,6 +249,7 @@ export const POST: APIRoute = async ({ request, locals }) => {
       configId: config.id,
       name: org.name,
       normalizedName: org.name.toLowerCase(),
+      provider: org.provider,
       avatarUrl: org.avatarUrl,
       membershipRole: "member" as const,
       isIncluded: false,
@@ -146,28 +269,43 @@ export const POST: APIRoute = async ({ request, locals }) => {
     await db.transaction(async (tx) => {
       const [existingRepos, existingOrgs] = await Promise.all([
         tx
-          .select({ normalizedFullName: repositories.normalizedFullName })
+          .select({
+            normalizedFullName: repositories.normalizedFullName,
+            provider: repositories.provider,
+          })
           .from(repositories)
           .where(eq(repositories.userId, userId)),
         tx
-          .select({ normalizedName: organizations.normalizedName, status: organizations.status })
+          .select({
+            normalizedName: organizations.normalizedName,
+            provider: organizations.provider,
+            status: organizations.status,
+          })
           .from(organizations)
           .where(eq(organizations.userId, userId)),
       ]);
 
-      const existingRepoNames = new Set(existingRepos.map((r) => r.normalizedFullName));
-      const existingOrgMap = new Map(existingOrgs.map((o) => [o.normalizedName, o.status]));
+      // Keyed by provider: the same path can legitimately exist on both forges.
+      const existingRepoNames = new Set(
+        existingRepos.map((r) => `${r.provider}:${r.normalizedFullName}`)
+      );
+      const existingOrgMap = new Map(
+        existingOrgs.map((o) => [`${o.provider}:${o.normalizedName}`, o.status])
+      );
 
       insertedRepos = newRepos.filter(
         (r) =>
-          !existingRepoNames.has(r.normalizedFullName) &&
-          (!r.organization || !ignoredOrgNames.has(r.organization.toLowerCase()))
+          !existingRepoNames.has(`${r.provider}:${r.normalizedFullName}`) &&
+          (!r.organization ||
+            !ignoredOrgKeys.has(`${r.provider}:${r.organization.toLowerCase()}`))
       );
-      insertedOrgs = newOrgs.filter((o) => !existingOrgMap.has(o.normalizedName));
+      insertedOrgs = newOrgs.filter(
+        (o) => !existingOrgMap.has(`${o.provider}:${o.normalizedName}`)
+      );
 
       // Update previously failed orgs that now succeeded
       const recoveredOrgs = newOrgs.filter(
-        (o) => existingOrgMap.get(o.normalizedName) === "failed"
+        (o) => existingOrgMap.get(`${o.provider}:${o.normalizedName}`) === "failed"
       );
       for (const org of recoveredOrgs) {
         await tx
@@ -183,6 +321,7 @@ export const POST: APIRoute = async ({ request, locals }) => {
           .where(
             and(
               eq(organizations.userId, userId),
+              eq(organizations.provider, org.provider),
               eq(organizations.normalizedName, org.normalizedName),
             )
           );
@@ -190,9 +329,11 @@ export const POST: APIRoute = async ({ request, locals }) => {
       recoveredOrgCount = recoveredOrgs.length;
 
       // Insert or update failed orgs (only update orgs already in "failed" state — don't overwrite good state)
-      insertedFailedOrgs = failedOrgRecords.filter((o) => !existingOrgMap.has(o.normalizedName));
+      insertedFailedOrgs = failedOrgRecords.filter(
+        (o) => !existingOrgMap.has(`${o.provider}:${o.normalizedName}`)
+      );
       const stillFailedOrgs = failedOrgRecords.filter(
-        (o) => existingOrgMap.get(o.normalizedName) === "failed"
+        (o) => existingOrgMap.get(`${o.provider}:${o.normalizedName}`) === "failed"
       );
       for (const org of stillFailedOrgs) {
         await tx
@@ -204,6 +345,7 @@ export const POST: APIRoute = async ({ request, locals }) => {
           .where(
             and(
               eq(organizations.userId, userId),
+              eq(organizations.provider, org.provider),
               eq(organizations.normalizedName, org.normalizedName),
             )
           );
@@ -219,7 +361,7 @@ export const POST: APIRoute = async ({ request, locals }) => {
           await tx
             .insert(repositories)
             .values(batch)
-            .onConflictDoNothing({ target: [repositories.userId, repositories.normalizedFullName] });
+            .onConflictDoNothing({ target: [repositories.userId, repositories.provider, repositories.normalizedFullName] });
         }
       }
 
@@ -229,7 +371,18 @@ export const POST: APIRoute = async ({ request, locals }) => {
       if (allNewOrgs.length > 0) {
         for (let i = 0; i < allNewOrgs.length; i += ORG_BATCH_SIZE) {
           const batch = allNewOrgs.slice(i, i + ORG_BATCH_SIZE);
-          await tx.insert(organizations).values(batch);
+          // Backstop: an unexpected duplicate must skip that row, not abort the
+          // whole import transaction and lose every repository with it.
+          await tx
+            .insert(organizations)
+            .values(batch)
+            .onConflictDoNothing({
+              target: [
+                organizations.userId,
+                organizations.provider,
+                organizations.normalizedName,
+              ],
+            });
         }
       }
     });
@@ -243,7 +396,7 @@ export const POST: APIRoute = async ({ request, locals }) => {
           repositoryName: repo.name,
           status: "imported",
           message: `Repository ${repo.name} fetched successfully`,
-          details: `Repository ${repo.name} was fetched from GitHub`,
+          details: `Repository ${repo.name} was fetched from ${repo.provider === "gitlab" ? "GitLab" : "GitHub"}`,
         })
       ),
       ...insertedOrgs.map((org) =>
@@ -253,7 +406,7 @@ export const POST: APIRoute = async ({ request, locals }) => {
           organizationName: org.name,
           status: "imported",
           message: `Organization ${org.name} fetched successfully`,
-          details: `Organization ${org.name} was fetched from GitHub`,
+          details: `Organization ${org.name} was fetched from ${org.provider === "gitlab" ? "GitLab" : "GitHub"}`,
         })
       ),
     ];
@@ -266,12 +419,16 @@ export const POST: APIRoute = async ({ request, locals }) => {
         message: "Repositories and organizations synced successfully",
         newRepositories: insertedRepos.length,
         newOrganizations: insertedOrgs.length,
-        skippedDisabledRepositories: allGithubRepos.length - mirrorableGithubRepos.length,
-        failedOrgs: failedOrgs.filter((o) => !ignoredOrgNames.has(o.name.toLowerCase())).map((o) => o.name),
+        skippedDisabledRepositories,
+        failedOrgs: failedOrgs
+          .filter((o) => !ignoredOrgKeys.has(`${o.provider}:${o.name.toLowerCase()}`))
+          .map((o) => o.name),
         recoveredOrgs: recoveredOrgCount,
+        // Present only when at least one source failed while another succeeded.
+        ...(sourceErrors.length > 0 ? { sourceErrors } : {}),
       },
     });
   } catch (error) {
-    return createSecureErrorResponse(error, "GitHub data sync", 500);
+    return createSecureErrorResponse(error, "source data sync", 500);
   }
 };

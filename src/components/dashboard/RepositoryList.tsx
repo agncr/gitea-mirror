@@ -1,7 +1,8 @@
 import { Card, CardContent, CardHeader, CardTitle } from "@/components/ui/card";
 import { Button } from "@/components/ui/button";
 import { GitFork } from "lucide-react";
-import { SiGithub, SiGitea } from "react-icons/si";
+import { SiGithub, SiGitea, SiGitlab } from "react-icons/si";
+import { sourceProviderOf, sourceProviderLabel } from "@/lib/utils/source-provider-ui";
 import type { Repository } from "@/lib/db/schema";
 import { getStatusColor } from "@/lib/utils";
 import { buildGiteaWebUrl } from "@/lib/gitea-url";
@@ -55,10 +56,10 @@ export function RepositoryList({ repositories }: RepositoryListProps) {
             <GitFork className="h-10 w-10 text-muted-foreground mb-4" />
             <h3 className="text-lg font-medium">No repositories found</h3>
             <p className="text-sm text-muted-foreground mt-1 mb-4">
-              Configure your GitHub connection to start mirroring repositories.
+              Connect GitHub or GitLab to start mirroring repositories.
             </p>
             <Button asChild>
-              <a href={withBase("/config")}>Configure GitHub</a>
+              <a href={withBase("/config")}>Configure a source</a>
             </Button>
           </div>
         ) : (
@@ -136,9 +137,13 @@ export function RepositoryList({ repositories }: RepositoryListProps) {
                       href={repo.url}
                       target="_blank"
                       rel="noopener noreferrer"
-                      title="View on GitHub"
+                      title={`View on ${sourceProviderLabel((repo as any).provider)}`}
                     >
-                      <SiGithub className="h-4 w-4" />
+                      {sourceProviderOf((repo as any).provider) === "gitlab" ? (
+                        <SiGitlab className="h-4 w-4" />
+                      ) : (
+                        <SiGithub className="h-4 w-4" />
+                      )}
                     </a>
                   </Button>
                 </div>

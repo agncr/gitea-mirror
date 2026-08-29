@@ -11,9 +11,10 @@ export function mergeGitReposPreferStarred(
 ): GitRepo[] {
   const map = new Map<string, GitRepo>();
   for (const r of [...basicAndForked, ...starred]) {
-    const existing = map.get(r.fullName);
+    const key = `${r.provider ?? 'github'}:${r.fullName}`;
+    const existing = map.get(key);
     if (!existing || (!existing.isStarred && r.isStarred)) {
-      map.set(r.fullName, r);
+      map.set(key, r);
     }
   }
   return Array.from(map.values());
@@ -36,6 +37,7 @@ export function normalizeGitRepoToInsert(
     normalizedFullName: repo.fullName.toLowerCase(),
     url: repo.url,
     cloneUrl: repo.cloneUrl,
+    provider: repo.provider ?? 'github',
     owner: repo.owner,
     organization: repo.organization ?? null,
     mirroredLocation: repo.mirroredLocation || '',

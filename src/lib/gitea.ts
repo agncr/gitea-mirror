@@ -6,14 +6,19 @@ import {
 import { membershipRoleEnum } from "@/types/organizations";
 import { Octokit } from "@octokit/rest";
 import type { Config } from "@/types/config";
-import type { Organization, Repository } from "./db/schema";
+import type { Organization, Repository, RepoProvider } from "./db/schema";
 import { httpPost, httpGet, httpDelete, httpPut, httpPatch } from "./http-client";
 import { createMirrorJob } from "./helpers";
 import { db, organizations, repositories } from "./db";
 import { eq, and, ne } from "drizzle-orm";
 import { decryptConfigTokens } from "./utils/config-encryption";
 import { formatDateShort } from "./utils";
-import { buildGithubSourceAuthPayload } from "./utils/mirror-source-auth";
+import { buildSourceAuthPayload } from "./utils/mirror-source-auth";
+import { getMirrorPlacementSettings } from "./utils/mirror-placement";
+import {
+  organizationIdentityFilter,
+  organizationRepositoriesFilter,
+} from "./utils/org-scope";
 import {
   parseRepositoryMetadataState,
   serializeRepositoryMetadataState,
@@ -29,15 +34,18 @@ import {
 export const getOrganizationConfig = async ({
   orgName,
   userId,
+  provider = "github",
 }: {
   orgName: string;
   userId: string;
+  /** Which forge the organization belongs to; see organizationIdentityFilter. */
+  provider?: RepoProvider;
 }): Promise<Organization | null> => {
   try {
     const result = await db
       .select()
       .from(organizations)
-      .where(and(eq(organizations.name, orgName), eq(organizations.userId, userId)))
+      .where(organizationIdentityFilter({ userId, name: orgName, provider }))
       .limit(1);
 
     if (!result[0]) {
@@ -70,25 +78,20 @@ export const getGiteaRepoOwnerAsync = async ({
   config: Partial<Config>;
   repository: Repository;
 }): Promise<string> => {
-  if (!config.githubConfig || !config.giteaConfig) {
-    throw new Error("GitHub or Gitea config is required.");
-  }
-
-  if (!config.giteaConfig.defaultOwner) {
-    throw new Error("Gitea username is required.");
-  }
+  assertPlacementConfig(config, repository);
 
   if (!config.userId) {
     throw new Error("User ID is required for organization overrides.");
   }
 
+  const placement = getMirrorPlacementSettings(config, repository.provider);
+
   // Check if repository is starred
   if (repository.isStarred) {
-    const starredReposMode = config.githubConfig.starredReposMode || "dedicated-org";
-    if (starredReposMode === "preserve-owner") {
+    if (placement.starredReposMode === "preserve-owner") {
       return repository.organization || repository.owner;
     }
-    return config.githubConfig.starredReposOrg || "starred";
+    return placement.starredReposOrg;
   }
 
   // Check for repository-specific override (second highest priority)
@@ -102,6 +105,7 @@ export const getGiteaRepoOwnerAsync = async ({
     const orgConfig = await getOrganizationConfig({
       orgName: repository.organization,
       userId: config.userId,
+      provider: repository.provider ?? "github",
     });
 
     if (orgConfig?.destinationOrg) {
@@ -116,6 +120,30 @@ export const getGiteaRepoOwnerAsync = async ({
   return getGiteaRepoOwner({ config, repository });
 };
 
+/**
+ * Placement needs a Gitea destination for every repository, but a source config
+ * only for GitHub rows: a GitLab-only setup legitimately has an empty
+ * `githubConfig`, and failing there would make every GitLab mirror unplaceable.
+ */
+function assertPlacementConfig(
+  config: Partial<Config>,
+  repository: Repository,
+): asserts config is Partial<Config> & {
+  giteaConfig: NonNullable<Config["giteaConfig"]>;
+} {
+  if (!config.giteaConfig) {
+    throw new Error("Gitea config is required.");
+  }
+
+  if ((repository.provider ?? "github") === "github" && !config.githubConfig) {
+    throw new Error("GitHub or Gitea config is required.");
+  }
+
+  if (!config.giteaConfig.defaultOwner) {
+    throw new Error("Gitea username is required.");
+  }
+}
+
 export const getGiteaRepoOwner = ({
   config,
   repository,
@@ -123,34 +151,20 @@ export const getGiteaRepoOwner = ({
   config: Partial<Config>;
   repository: Repository;
 }): string => {
-  if (!config.githubConfig || !config.giteaConfig) {
-    throw new Error("GitHub or Gitea config is required.");
-  }
+  assertPlacementConfig(config, repository);
 
-  if (!config.giteaConfig.defaultOwner) {
-    throw new Error("Gitea username is required.");
-  }
+  const placement = getMirrorPlacementSettings(config, repository.provider);
 
   // Check if repository is starred
   if (repository.isStarred) {
-    const starredReposMode = config.githubConfig.starredReposMode || "dedicated-org";
-    if (starredReposMode === "preserve-owner") {
+    if (placement.starredReposMode === "preserve-owner") {
       return repository.organization || repository.owner;
     }
-    return config.githubConfig.starredReposOrg || "starred";
+    return placement.starredReposOrg;
   }
 
-  // Get the mirror strategy - use preserveOrgStructure for backward compatibility
-  const mirrorStrategy = config.githubConfig.mirrorStrategy || 
-    (config.giteaConfig.preserveOrgStructure ? "preserve" : "flat-user");
-  const configuredGitHubOwner =
-    (
-      config.githubConfig.owner ||
-      (config.githubConfig as typeof config.githubConfig & { username?: string }).username ||
-      ""
-    )
-      .trim()
-      .toLowerCase();
+  const mirrorStrategy = placement.mirrorStrategy;
+  const configuredGitHubOwner = placement.sourceOwner;
 
   switch (mirrorStrategy) {
     case "preserve":
@@ -620,7 +634,8 @@ export const mirrorGithubRepoToGitea = async ({
   repository,
   config,
 }: {
-  octokit: Octokit;
+  /** Null for GitLab-sourced repositories, which mirror code without Octokit. */
+  octokit: Octokit | null;
   repository: Repository;
   config: Partial<Config>;
 }): Promise<any> => {
@@ -630,7 +645,13 @@ export const mirrorGithubRepoToGitea = async ({
   // the real error and left repos stuck in "mirroring" state.
   let migrateSucceeded = false;
   try {
-    if (!config.userId || !config.githubConfig || !config.giteaConfig) {
+    // A GitLab-only setup has no populated githubConfig, so only require the
+    // source config that matches this repository's provider.
+    const repoProvider = repository.provider ?? "github";
+    if (!config.userId || !config.giteaConfig) {
+      throw new Error("github config and gitea config are required.");
+    }
+    if (repoProvider === "github" && !config.githubConfig) {
       throw new Error("github config and gitea config are required.");
     }
 
@@ -643,15 +664,9 @@ export const mirrorGithubRepoToGitea = async ({
 
     // Get the correct owner based on the strategy (with organization overrides)
     let repoOwner = await getGiteaRepoOwnerAsync({ config, repository });
-    const mirrorStrategy = config.githubConfig.mirrorStrategy ||
-      (config.giteaConfig.preserveOrgStructure ? "preserve" : "flat-user");
-    const configuredGitHubOwner = (
-      config.githubConfig.owner ||
-      (config.githubConfig as typeof config.githubConfig & { username?: string }).username ||
-      ""
-    )
-      .trim()
-      .toLowerCase();
+    const placement = getMirrorPlacementSettings(config, repoProvider);
+    const mirrorStrategy = placement.mirrorStrategy;
+    const configuredGitHubOwner = placement.sourceOwner;
     const normalizedRepoOwner = repository.owner.trim().toLowerCase();
     const isExternalPersonalRepoInPreserveMode =
       mirrorStrategy === "preserve" &&
@@ -973,14 +988,16 @@ export const mirrorGithubRepoToGitea = async ({
           config.githubConfig as typeof config.githubConfig & {
             owner?: string;
           }
-        ).owner || "";
+        )?.owner || "";
 
       Object.assign(
         migratePayload,
-        buildGithubSourceAuthPayload({
-          token: decryptedConfig.githubConfig.token,
+        buildSourceAuthPayload({
+          provider: repository.provider ?? "github",
+          githubToken: decryptedConfig.githubConfig?.token,
+          gitlabToken: decryptedConfig.gitlabConfig?.token,
           githubOwner,
-          githubUsername: config.githubConfig.username,
+          githubUsername: config.githubConfig?.username,
           repositoryOwner: repository.owner,
         })
       );
@@ -1016,11 +1033,16 @@ export const mirrorGithubRepoToGitea = async ({
       `[Metadata] Release mirroring check: mirrorReleases=${mirrorOptions.mirrorReleases}, isStarred=${repository.isStarred}, starredCodeOnly=${config.githubConfig?.starredCodeOnly}, shouldMirrorReleases=${shouldMirrorReleases}`
     );
 
-    if (shouldMirrorReleases) {
+    // Metadata mirroring is Octokit-driven. GitLab-sourced repositories reach
+    // this point with a null client and mirror code (and wiki, via the
+    // migration payload) only.
+    const metadataOctokit = octokit;
+
+    if (metadataOctokit && shouldMirrorReleases) {
       try {
         await mirrorGitHubReleasesToGitea({
           config,
-          octokit,
+          octokit: metadataOctokit,
           repository,
           giteaOwner: repoOwner,
           giteaRepoName: targetRepoName,
@@ -1051,11 +1073,11 @@ export const mirrorGithubRepoToGitea = async ({
       `[Metadata] Issue mirroring check: mirrorIssues=${mirrorOptions.mirrorIssues}, isStarred=${repository.isStarred}, starredCodeOnly=${config.githubConfig?.starredCodeOnly}, shouldMirrorIssues=${shouldMirrorIssuesThisRun}`
     );
 
-    if (shouldMirrorIssuesThisRun) {
+    if (metadataOctokit && shouldMirrorIssuesThisRun) {
       try {
         await mirrorGitRepoIssuesToGitea({
           config,
-          octokit,
+          octokit: metadataOctokit,
           repository,
           giteaOwner: repoOwner,
           giteaRepoName: targetRepoName,
@@ -1082,11 +1104,11 @@ export const mirrorGithubRepoToGitea = async ({
       `[Metadata] Pull request mirroring check: mirrorPullRequests=${mirrorOptions.mirrorPullRequests}, isStarred=${repository.isStarred}, starredCodeOnly=${config.githubConfig?.starredCodeOnly}, shouldMirrorPullRequests=${shouldMirrorPullRequests}`
     );
 
-    if (shouldMirrorPullRequests) {
+    if (metadataOctokit && shouldMirrorPullRequests) {
       try {
         await mirrorGitRepoPullRequestsToGitea({
           config,
-          octokit,
+          octokit: metadataOctokit,
           repository,
           giteaOwner: repoOwner,
           giteaRepoName: targetRepoName,
@@ -1114,11 +1136,11 @@ export const mirrorGithubRepoToGitea = async ({
       `[Metadata] Label mirroring check: mirrorLabels=${mirrorOptions.mirrorLabels}, issuesRunning=${shouldMirrorIssuesThisRun}, isStarred=${repository.isStarred}, starredCodeOnly=${config.githubConfig?.starredCodeOnly}, shouldMirrorLabels=${shouldMirrorLabels}`
     );
 
-    if (shouldMirrorLabels) {
+    if (metadataOctokit && shouldMirrorLabels) {
       try {
         await mirrorGitRepoLabelsToGitea({
           config,
-          octokit,
+          octokit: metadataOctokit,
           repository,
           giteaOwner: repoOwner,
           giteaRepoName: targetRepoName,
@@ -1144,11 +1166,11 @@ export const mirrorGithubRepoToGitea = async ({
       `[Metadata] Milestone mirroring check: mirrorMilestones=${mirrorOptions.mirrorMilestones}, isStarred=${repository.isStarred}, starredCodeOnly=${config.githubConfig?.starredCodeOnly}, shouldMirrorMilestones=${shouldMirrorMilestones}`
     );
 
-    if (shouldMirrorMilestones) {
+    if (metadataOctokit && shouldMirrorMilestones) {
       try {
         await mirrorGitRepoMilestonesToGitea({
           config,
-          octokit,
+          octokit: metadataOctokit,
           repository,
           giteaOwner: repoOwner,
           giteaRepoName: targetRepoName,
@@ -1469,7 +1491,8 @@ export async function mirrorGitHubRepoToGiteaOrg({
   giteaOrgId,
   orgName,
 }: {
-  octokit: Octokit;
+  /** Null for GitLab-sourced repositories, which mirror code without Octokit. */
+  octokit: Octokit | null;
   config: Partial<Config>;
   repository: Repository;
   giteaOrgId: number;
@@ -1736,8 +1759,10 @@ export async function mirrorGitHubRepoToGiteaOrg({
 
       Object.assign(
         migratePayload,
-        buildGithubSourceAuthPayload({
-          token: decryptedConfig.githubConfig?.token,
+        buildSourceAuthPayload({
+          provider: repository.provider ?? "github",
+          githubToken: decryptedConfig.githubConfig?.token,
+          gitlabToken: decryptedConfig.gitlabConfig?.token,
           githubOwner,
           githubUsername: config.githubConfig?.username,
           repositoryOwner: repository.owner,
@@ -1774,11 +1799,16 @@ export async function mirrorGitHubRepoToGiteaOrg({
       `[Metadata] Release mirroring check: mirrorReleases=${mirrorOptions.mirrorReleases}, isStarred=${repository.isStarred}, starredCodeOnly=${config.githubConfig?.starredCodeOnly}, shouldMirrorReleases=${shouldMirrorReleases}`
     );
 
-    if (shouldMirrorReleases) {
+    // Metadata mirroring is Octokit-driven. GitLab-sourced repositories reach
+    // this point with a null client and mirror code (and wiki, via the
+    // migration payload) only.
+    const metadataOctokit = octokit;
+
+    if (metadataOctokit && shouldMirrorReleases) {
       try {
         await mirrorGitHubReleasesToGitea({
           config,
-          octokit,
+          octokit: metadataOctokit,
           repository,
           giteaOwner: orgName,
           giteaRepoName: targetRepoName,
@@ -1807,11 +1837,11 @@ export async function mirrorGitHubRepoToGiteaOrg({
       `[Metadata] Issue mirroring check: mirrorIssues=${mirrorOptions.mirrorIssues}, isStarred=${repository.isStarred}, starredCodeOnly=${config.githubConfig?.starredCodeOnly}, shouldMirrorIssues=${shouldMirrorIssuesThisRun}`
     );
 
-    if (shouldMirrorIssuesThisRun) {
+    if (metadataOctokit && shouldMirrorIssuesThisRun) {
       try {
         await mirrorGitRepoIssuesToGitea({
           config,
-          octokit,
+          octokit: metadataOctokit,
           repository,
           giteaOwner: orgName,
           giteaRepoName: targetRepoName,
@@ -1838,11 +1868,11 @@ export async function mirrorGitHubRepoToGiteaOrg({
       `[Metadata] Pull request mirroring check: mirrorPullRequests=${mirrorOptions.mirrorPullRequests}, isStarred=${repository.isStarred}, starredCodeOnly=${config.githubConfig?.starredCodeOnly}, shouldMirrorPullRequests=${shouldMirrorPullRequests}`
     );
 
-    if (shouldMirrorPullRequests) {
+    if (metadataOctokit && shouldMirrorPullRequests) {
       try {
         await mirrorGitRepoPullRequestsToGitea({
           config,
-          octokit,
+          octokit: metadataOctokit,
           repository,
           giteaOwner: orgName,
           giteaRepoName: targetRepoName,
@@ -1870,11 +1900,11 @@ export async function mirrorGitHubRepoToGiteaOrg({
       `[Metadata] Label mirroring check: mirrorLabels=${mirrorOptions.mirrorLabels}, issuesRunning=${shouldMirrorIssuesThisRun}, isStarred=${repository.isStarred}, starredCodeOnly=${config.githubConfig?.starredCodeOnly}, shouldMirrorLabels=${shouldMirrorLabels}`
     );
 
-    if (shouldMirrorLabels) {
+    if (metadataOctokit && shouldMirrorLabels) {
       try {
         await mirrorGitRepoLabelsToGitea({
           config,
-          octokit,
+          octokit: metadataOctokit,
           repository,
           giteaOwner: orgName,
           giteaRepoName: targetRepoName,
@@ -1900,11 +1930,11 @@ export async function mirrorGitHubRepoToGiteaOrg({
       `[Metadata] Milestone mirroring check: mirrorMilestones=${mirrorOptions.mirrorMilestones}, isStarred=${repository.isStarred}, starredCodeOnly=${config.githubConfig?.starredCodeOnly}, shouldMirrorMilestones=${shouldMirrorMilestones}`
     );
 
-    if (shouldMirrorMilestones) {
+    if (metadataOctokit && shouldMirrorMilestones) {
       try {
         await mirrorGitRepoMilestonesToGitea({
           config,
-          octokit,
+          octokit: metadataOctokit,
           repository,
           giteaOwner: orgName,
           giteaRepoName: targetRepoName,
@@ -2008,7 +2038,8 @@ export async function mirrorGitHubOrgRepoToGiteaOrg({
   orgName,
 }: {
   config: Partial<Config>;
-  octokit: Octokit;
+  /** Null for GitLab-sourced repositories, which mirror code without Octokit. */
+  octokit: Octokit | null;
   repository: Repository;
   orgName: string;
 }) {
@@ -2043,16 +2074,16 @@ export async function mirrorGitHubOrgToGitea({
   config,
 }: {
   organization: Organization;
-  octokit: Octokit;
+  /** Null for GitLab-sourced organizations, whose repos mirror without Octokit. */
+  octokit: Octokit | null;
   config: Partial<Config>;
 }) {
+  const orgProvider = organization.provider ?? "github";
   try {
-    if (
-      !config.userId ||
-      !config.id ||
-      !config.githubConfig?.token ||
-      !config.giteaConfig?.url
-    ) {
+    if (!config.userId || !config.id || !config.giteaConfig?.url) {
+      throw new Error("Config and Gitea URL are required.");
+    }
+    if (orgProvider === "github" && !config.githubConfig?.token) {
       throw new Error("Config, GitHub token and Gitea URL are required.");
     }
 
@@ -2125,11 +2156,20 @@ export async function mirrorGitHubOrgToGitea({
       targetOrgName = config.giteaConfig?.defaultOwner || "";
     }
 
-    //query the db with the org name and get the repos
+    // Scoped by user AND provider. Two users can each have imported an
+    // organization of the same name, and since migration 0015 the same name can
+    // also exist on both forges — without both terms this job would mirror
+    // another user's rows using this user's Gitea and source configuration.
     const orgRepos = await db
       .select()
       .from(repositories)
-      .where(eq(repositories.organization, organization.name));
+      .where(
+        organizationRepositoriesFilter({
+          userId: config.userId,
+          organizationName: organization.name,
+          provider: orgProvider,
+        })
+      );
 
     if (orgRepos.length === 0) {
       console.log(
@@ -2167,15 +2207,19 @@ export async function mirrorGitHubOrgToGitea({
           // Resolve per repo with the canonical precedence
           const owner = await getGiteaRepoOwnerAsync({ config, repository: repoData });
 
+          // GitLab repositories mirror code through Gitea's migration and
+          // need no source API client.
+          const repoOctokit = (repoData.provider ?? "github") === "gitlab" ? null : octokit;
+
           if (owner === config.giteaConfig?.defaultOwner) {
             await mirrorGithubRepoToGitea({
-              octokit,
+              octokit: repoOctokit,
               repository: repoData,
               config,
             });
           } else if (owner === targetOrgName && giteaOrgId !== undefined) {
             await mirrorGitHubRepoToGiteaOrg({
-              octokit,
+              octokit: repoOctokit,
               config,
               repository: repoData,
               giteaOrgId,
@@ -2187,7 +2231,7 @@ export async function mirrorGitHubOrgToGitea({
               config,
             });
             await mirrorGitHubRepoToGiteaOrg({
-              octokit,
+              octokit: repoOctokit,
               config,
               repository: repoData,
               giteaOrgId: ownerOrgId,

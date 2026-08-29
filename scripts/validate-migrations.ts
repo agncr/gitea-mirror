@@ -448,6 +448,110 @@ function validateBroken0013Repair() {
   }
 }
 
+function seedPre0015Database(db: any) {
+  // Migrations 0000-0014 have run: repositories/organizations exist but have no
+  // provider column, and configs has no gitlab_config. Seed one of each so the
+  // backfill and the rebuilt unique indexes are checked against real rows.
+  db.run("INSERT INTO users (id, email, username, name) VALUES ('u-src', 'src@example.com', 'src', 'Source User')");
+  db.run("INSERT INTO configs (id, user_id, name, is_active, github_config, gitea_config, schedule_config, cleanup_config) VALUES ('cfg-pre15', 'u-src', 'Default', 1, '{}', '{}', '{}', '{}')");
+  db.run("INSERT INTO organizations (id, user_id, config_id, name, avatar_url, normalized_name) VALUES ('org-pre15', 'u-src', 'cfg-pre15', 'Acme', 'https://example.com/a.png', 'acme')");
+  db.run(
+    "INSERT INTO repositories (id, user_id, config_id, name, full_name, normalized_full_name, url, clone_url, owner, default_branch) " +
+      "VALUES ('repo-pre15', 'u-src', 'cfg-pre15', 'api', 'Acme/api', 'acme/api', 'https://github.com/Acme/api', 'https://github.com/Acme/api.git', 'Acme', 'main')",
+  );
+}
+
+function verify0015Migration(db: any) {
+  // 1. Both tables gained a NOT NULL provider column defaulting to 'github'.
+  for (const table of ["repositories", "organizations"]) {
+    const cols = db.query(`PRAGMA table_info(${table})`).all() as TableInfoRow[];
+    const col = cols.find((c) => c.name === "provider");
+    assert(col, `Expected ${table}.provider column to exist`);
+    assert(col.notnull === 1, `Expected ${table}.provider to be NOT NULL`);
+    assert(
+      col.dflt_value === "'github'",
+      `Expected ${table}.provider default to be 'github', got ${col.dflt_value ?? "null"}`,
+    );
+  }
+
+  // 2. Pre-existing rows are backfilled to github, not left empty.
+  const repoRow = db
+    .query("SELECT provider FROM repositories WHERE id = 'repo-pre15'")
+    .get() as { provider: string } | null;
+  assert(repoRow?.provider === "github", `Expected existing repository to backfill to github, got ${repoRow?.provider ?? "null"}`);
+
+  const orgRow = db
+    .query("SELECT provider FROM organizations WHERE id = 'org-pre15'")
+    .get() as { provider: string } | null;
+  assert(orgRow?.provider === "github", `Expected existing organization to backfill to github, got ${orgRow?.provider ?? "null"}`);
+
+  // 3. configs gained a nullable gitlab_config column (NULL = never configured).
+  const configCols = db.query("PRAGMA table_info(configs)").all() as TableInfoRow[];
+  const gitlabCol = configCols.find((c) => c.name === "gitlab_config");
+  assert(gitlabCol, "Expected configs.gitlab_config column to exist");
+  assert(gitlabCol.notnull === 0, "Expected configs.gitlab_config to be nullable");
+  const cfgRow = db
+    .query("SELECT gitlab_config FROM configs WHERE id = 'cfg-pre15'")
+    .get() as { gitlab_config: string | null } | null;
+  assert(
+    cfgRow?.gitlab_config === null,
+    `Expected existing config to have NULL gitlab_config, got ${cfgRow?.gitlab_config}`,
+  );
+
+  // 4. The provider-scoped unique indexes replaced the old provider-blind ones.
+  const indexNames = (
+    db
+      .query("SELECT name FROM sqlite_master WHERE type = 'index' AND tbl_name IN ('repositories', 'organizations')")
+      .all() as Array<{ name: string }>
+  ).map((r) => r.name);
+
+  for (const expected of [
+    "uniq_repositories_user_provider_full_name",
+    "uniq_repositories_user_provider_normalized_full_name",
+    "uniq_organizations_user_provider_normalized_name",
+  ]) {
+    assert(indexNames.includes(expected), `Expected index ${expected} to exist after migration`);
+  }
+  for (const dropped of [
+    "uniq_repositories_user_full_name",
+    "uniq_repositories_user_normalized_full_name",
+    "uniq_organizations_user_normalized_name",
+  ]) {
+    assert(!indexNames.includes(dropped), `Expected old index ${dropped} to be dropped`);
+  }
+
+  // 5. The whole point: the same path on two forges must coexist for one user,
+  // while a duplicate within one provider must still be rejected.
+  db.run(
+    "INSERT INTO repositories (id, user_id, config_id, name, full_name, normalized_full_name, url, clone_url, provider, owner, default_branch) " +
+      "VALUES ('repo-gl', 'u-src', 'cfg-pre15', 'api', 'Acme/api', 'acme/api', 'https://gitlab.com/Acme/api', 'https://gitlab.com/Acme/api.git', 'gitlab', 'Acme', 'main')",
+  );
+  const bothForges = db
+    .query("SELECT COUNT(*) AS n FROM repositories WHERE normalized_full_name = 'acme/api'")
+    .get() as { n: number };
+  assert(bothForges.n === 2, `Expected github and gitlab copies of acme/api to coexist, got ${bothForges.n}`);
+
+  let duplicateRejected = false;
+  try {
+    db.run(
+      "INSERT INTO repositories (id, user_id, config_id, name, full_name, normalized_full_name, url, clone_url, provider, owner, default_branch) " +
+        "VALUES ('repo-dup', 'u-src', 'cfg-pre15', 'api', 'Acme/api', 'acme/api', 'https://gitlab.com/Acme/api', 'https://gitlab.com/Acme/api.git', 'gitlab', 'Acme', 'main')",
+    );
+  } catch {
+    duplicateRejected = true;
+  }
+  assert(duplicateRejected, "Expected a duplicate (user, provider, full_name) insert to be rejected");
+
+  // Organizations get the same treatment.
+  db.run(
+    "INSERT INTO organizations (id, user_id, config_id, name, avatar_url, normalized_name, provider) VALUES ('org-gl', 'u-src', 'cfg-pre15', 'Acme', 'https://example.com/a.png', 'acme', 'gitlab')",
+  );
+  const orgsBothForges = db
+    .query("SELECT COUNT(*) AS n FROM organizations WHERE normalized_name = 'acme'")
+    .get() as { n: number };
+  assert(orgsBothForges.n === 2, `Expected github and gitlab copies of org acme to coexist, got ${orgsBothForges.n}`);
+}
+
 const latestUpgradeFixtures: Record<string, UpgradeFixture> = {
   "0009_nervous_tyger_tiger": {
     seed: seedPre0009Database,
@@ -472,6 +576,10 @@ const latestUpgradeFixtures: Record<string, UpgradeFixture> = {
   "0014_needy_white_tiger": {
     seed: seedPre0014Database,
     verify: verify0014Migration,
+  },
+  "0015_huge_squadron_sinister": {
+    seed: seedPre0015Database,
+    verify: verify0015Migration,
   },
 };
 

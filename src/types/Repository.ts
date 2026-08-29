@@ -1,4 +1,4 @@
-import type { Repository } from "@/lib/db/schema";
+import type { Repository, RepoProvider } from "@/lib/db/schema";
 import { z } from "zod";
 
 export const repoStatusEnum = z.enum([
@@ -26,6 +26,8 @@ export const repositoryVisibilityEnum = z.enum([
 
 export type RepositoryVisibility = z.infer<typeof repositoryVisibilityEnum>;
 
+export { repoProviderEnum, type RepoProvider } from "@/lib/db/schema";
+
 export interface RepositoryApiSuccessResponse {
   success: true;
   message: string;
@@ -47,6 +49,8 @@ export interface GitRepo {
   fullName: string;
   url: string;
   cloneUrl: string;
+
+  provider: RepoProvider;
 
   owner: string;
   organization?: string;

@@ -13,6 +13,15 @@ export const userSchema = z.object({
   updatedAt: z.coerce.date(),
 });
 
+/**
+ * The forge a repository or organization was discovered on. Rows that predate
+ * GitLab support are backfilled to "github" by the column default, so an absent
+ * value always means GitHub.
+ */
+export const repoProviderEnum = z.enum(["github", "gitlab"]);
+
+export type RepoProvider = z.infer<typeof repoProviderEnum>;
+
 export const githubConfigSchema = z.object({
   owner: z.string(),
   type: z.enum(["personal", "organization"]),
@@ -36,6 +45,34 @@ export const githubConfigSchema = z.object({
   starredDuplicateStrategy: z.enum(["suffix", "prefix", "owner-org"]).default("suffix").optional(),
   skipPersonalRepos: z.boolean().default(false),
 });
+
+/**
+ * GitLab source configuration. Optional: a config row may have GitHub only,
+ * GitLab only, or both. An empty `token` means "not configured".
+ *
+ * Unlike `githubConfigSchema`, the field names here are identical between the
+ * UI type and the stored shape, so `config-mapper.ts` passes this through
+ * without renaming.
+ *
+ * Destination placement (mirrorStrategy, defaultOrg, ...) is deliberately NOT
+ * duplicated here — those live in `githubConfig` and apply to every source.
+ * See `getMirrorPlacementSettings` in `src/lib/utils/mirror-placement.ts`.
+ */
+export const gitlabConfigSchema = z.object({
+  url: z.string().default("https://gitlab.com"),
+  token: z.string().default(""),
+  username: z.string().optional(),
+  /** Top-level group paths to mirror, e.g. ["acme", "acme/platform"]. */
+  groups: z.array(z.string()).default([]),
+  includeSubgroups: z.boolean().default(true),
+  includeOwnProjects: z.boolean().default(false),
+  includeForks: z.boolean().default(true),
+  includeArchived: z.boolean().default(false),
+  includePrivate: z.boolean().default(true),
+  includePublic: z.boolean().default(true),
+});
+
+export type GitlabConfig = z.infer<typeof gitlabConfigSchema>;
 
 export const backupStrategyEnum = z.enum([
   "disabled",
@@ -199,6 +236,7 @@ export const configSchema = z.object({
   name: z.string(),
   isActive: z.boolean().default(true),
   githubConfig: githubConfigSchema,
+  gitlabConfig: gitlabConfigSchema.nullable().optional(),
   giteaConfig: giteaConfigSchema,
   // Unused/reserved — stored for future glob support but not currently read
   include: z.array(z.string()).default(["*"]),
@@ -219,6 +257,7 @@ export const repositorySchema = z.object({
   normalizedFullName: z.string(),
   url: z.url(),
   cloneUrl: z.url(),
+  provider: repoProviderEnum.default("github"),
   owner: z.string(),
   organization: z.string().optional().nullable(),
   mirroredLocation: z.string().default(""),
@@ -305,6 +344,7 @@ export const organizationSchema = z.object({
   configId: z.string(),
   name: z.string(),
   normalizedName: z.string(),
+  provider: repoProviderEnum.default("github"),
   avatarUrl: z.string(),
   membershipRole: z.enum(["member", "admin", "owner", "billing_manager"]).default("member"),
   isIncluded: z.boolean().default(true),
@@ -390,6 +430,11 @@ export const configs = sqliteTable("configs", {
     .$type<z.infer<typeof githubConfigSchema>>()
     .notNull(),
 
+  // Nullable: GitLab is an optional second source. NULL means "never configured"
+  // and must be preserved on partial config saves.
+  gitlabConfig: text("gitlab_config", { mode: "json" })
+    .$type<z.infer<typeof gitlabConfigSchema>>(),
+
   giteaConfig: text("gitea_config", { mode: "json" })
     .$type<z.infer<typeof giteaConfigSchema>>()
     .notNull(),
@@ -439,6 +484,7 @@ export const repositories = sqliteTable("repositories", {
   normalizedFullName: text("normalized_full_name").notNull(),
   url: text("url").notNull(),
   cloneUrl: text("clone_url").notNull(),
+  provider: text("provider").notNull().default("github").$type<RepoProvider>(),
   owner: text("owner").notNull(),
   organization: text("organization"),
   mirroredLocation: text("mirrored_location").default(""),
@@ -500,8 +546,10 @@ export const repositories = sqliteTable("repositories", {
   index("idx_repositories_is_fork").on(table.isForked),
   index("idx_repositories_is_starred").on(table.isStarred),
   index("idx_repositories_user_imported_at").on(table.userId, table.importedAt),
-  uniqueIndex("uniq_repositories_user_full_name").on(table.userId, table.fullName),
-  uniqueIndex("uniq_repositories_user_normalized_full_name").on(table.userId, table.normalizedFullName),
+  // Scoped by provider: github.com/acme/api and gitlab.com/acme/api are
+  // distinct repositories that must both be mirrorable for one user.
+  uniqueIndex("uniq_repositories_user_provider_full_name").on(table.userId, table.provider, table.fullName),
+  uniqueIndex("uniq_repositories_user_provider_normalized_full_name").on(table.userId, table.provider, table.normalizedFullName),
   index("idx_repositories_mirrored_location").on(table.userId, table.mirroredLocation),
 ]);
 
@@ -554,6 +602,7 @@ export const organizations = sqliteTable("organizations", {
     .references(() => configs.id),
   name: text("name").notNull(),
   normalizedName: text("normalized_name").notNull(),
+  provider: text("provider").notNull().default("github").$type<RepoProvider>(),
 
   avatarUrl: text("avatar_url").notNull(),
 
@@ -589,7 +638,7 @@ export const organizations = sqliteTable("organizations", {
   index("idx_organizations_config_id").on(table.configId),
   index("idx_organizations_status").on(table.status),
   index("idx_organizations_is_included").on(table.isIncluded),
-  uniqueIndex("uniq_organizations_user_normalized_name").on(table.userId, table.normalizedName),
+  uniqueIndex("uniq_organizations_user_provider_normalized_name").on(table.userId, table.provider, table.normalizedName),
 ]);
 
 // ===== Better Auth Tables =====

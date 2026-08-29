@@ -316,6 +316,7 @@ export async function getGithubRepositories({
     return filteredRepos.map((repo) => ({
       name: repo.name,
       fullName: repo.full_name,
+      provider: "github" as const,
       url: repo.html_url,
       cloneUrl: repo.clone_url,
 
@@ -558,6 +559,7 @@ function mapGraphqlRepoToGitRepo(repo: GitHubRepositoryListItem): GitRepo {
   return {
     name: repo.name,
     fullName: repo.nameWithOwner,
+    provider: "github" as const,
     url: repo.url,
     cloneUrl: toHttpsCloneUrl(repo.url),
 
@@ -652,6 +654,7 @@ export async function getGithubStarredRepositories({
     return starredRepos.map((repo) => ({
       name: repo.name,
       fullName: repo.full_name,
+      provider: "github" as const,
       url: repo.html_url,
       cloneUrl: repo.clone_url,
 
@@ -757,6 +760,7 @@ export async function getGithubOrganizations({
 
           return {
             name: org.login,
+            provider: "github" as const,
             avatarUrl: org.avatar_url,
             membershipRole: membership.role as MembershipRole,
             isIncluded: false,
@@ -812,6 +816,7 @@ export async function getGithubOrganizationRepositories({
     return repos.map((repo) => ({
       name: repo.name,
       fullName: repo.full_name,
+      provider: "github" as const,
       url: repo.html_url,
       cloneUrl: repo.clone_url ?? "",
 

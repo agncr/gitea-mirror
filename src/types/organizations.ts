@@ -1,4 +1,4 @@
-import type { Organization } from "@/lib/db/schema";
+import type { Organization, RepoProvider } from "@/lib/db/schema";
 import { z } from "zod";
 import type { RepoStatus } from "./Repository";
 
@@ -29,6 +29,7 @@ export type OrganizationsApiResponse =
 
 export interface GitOrg {
   name: string;
+  provider: RepoProvider;
   avatarUrl: string;
   membershipRole: MembershipRole;
   isIncluded: boolean;

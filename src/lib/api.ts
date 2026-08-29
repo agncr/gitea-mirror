@@ -86,6 +86,19 @@ export const githubApi = {
     }),
 };
 
+// GitLab API
+export const gitlabApi = {
+  testConnection: (url: string, token: string) =>
+    apiRequest<{
+      success: boolean;
+      message?: string;
+      user?: { login: string; name?: string; avatar_url?: string };
+    }>("/gitlab/test-connection", {
+      method: "POST",
+      body: JSON.stringify({ url, token }),
+    }),
+};
+
 // Gitea API
 export interface GiteaServerInfo {
   type: "forgejo" | "gitea";

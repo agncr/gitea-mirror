@@ -5,6 +5,8 @@ import { repositoryVisibilityEnum, repoStatusEnum } from "@/types/Repository";
 import type { ResetMetadataRequest, ResetMetadataResponse } from "@/types/reset-metadata";
 import { createSecureErrorResponse } from "@/lib/utils";
 import { requireAuthenticatedUserId } from "@/lib/auth-guards";
+import { configuredSourceProviders } from "@/lib/utils/config-encryption";
+const hasAnySourceToken = (config: any) => configuredSourceProviders(config).length > 0;
 
 export const POST: APIRoute = async ({ request, locals }) => {
   try {
@@ -46,7 +48,7 @@ export const POST: APIRoute = async ({ request, locals }) => {
 
     const config = configResult[0];
 
-    if (!config || !config.githubConfig.token || !config.giteaConfig?.token) {
+    if (!config || !hasAnySourceToken(config) || !config.giteaConfig?.token) {
       return new Response(
         JSON.stringify({
           success: false,

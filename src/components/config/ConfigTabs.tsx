@@ -1,5 +1,6 @@
 import { useEffect, useState, useCallback, useRef } from 'react';
 import { GitHubConfigForm } from './GitHubConfigForm';
+import { GitLabConfigForm, DEFAULT_GITLAB_CONFIG } from './GitLabConfigForm';
 import { GiteaConfigForm } from './GiteaConfigForm';
 import { GitHubMirrorSettings } from './GitHubMirrorSettings';
 import { AutomationSettings } from './AutomationSettings';
@@ -9,6 +10,7 @@ import type {
   ConfigApiResponse,
   GiteaConfig,
   GitHubConfig,
+  GitLabConfig,
   SaveConfigApiRequest,
   SaveConfigApiResponse,
   ScheduleConfig,
@@ -29,6 +31,7 @@ import { withBase } from '@/lib/base-path';
 
 type ConfigState = {
   githubConfig: GitHubConfig;
+  gitlabConfig: GitLabConfig;
   giteaConfig: GiteaConfig;
   scheduleConfig: ScheduleConfig;
   cleanupConfig: DatabaseCleanupConfig;
@@ -48,6 +51,7 @@ export function ConfigTabs() {
       mirrorStarred: false,
       starredLists: [],
     },
+    gitlabConfig: DEFAULT_GITLAB_CONFIG,
     giteaConfig: {
       url: '',
       externalUrl: '',
@@ -109,31 +113,39 @@ export function ConfigTabs() {
   const [isAutoSavingSchedule, setIsAutoSavingSchedule] = useState<boolean>(false);
   const [isAutoSavingCleanup, setIsAutoSavingCleanup] = useState<boolean>(false);
   const [isAutoSavingGitHub, setIsAutoSavingGitHub] = useState<boolean>(false);
+  const [isAutoSavingGitLab, setIsAutoSavingGitLab] = useState<boolean>(false);
   const [isAutoSavingGitea, setIsAutoSavingGitea] = useState<boolean>(false);
   const [isAutoSavingNotification, setIsAutoSavingNotification] = useState<boolean>(false);
   const autoSaveScheduleTimeoutRef = useRef<NodeJS.Timeout | null>(null);
   const autoSaveCleanupTimeoutRef = useRef<NodeJS.Timeout | null>(null);
   const autoSaveGitHubTimeoutRef = useRef<NodeJS.Timeout | null>(null);
+  const autoSaveGitLabTimeoutRef = useRef<NodeJS.Timeout | null>(null);
   const autoSaveGiteaTimeoutRef = useRef<NodeJS.Timeout | null>(null);
   const autoSaveNotificationTimeoutRef = useRef<NodeJS.Timeout | null>(null);
 
   const isConfigFormValid = (): boolean => {
-    const { githubConfig, giteaConfig } = config;
-    const isGitHubValid = !!(
-      githubConfig.username.trim() && githubConfig.token.trim()
-    );
+    const { giteaConfig } = config;
     const isGiteaValid = !!(
       giteaConfig.url.trim() &&
       giteaConfig.username.trim() &&
       giteaConfig.token.trim()
     );
-    return isGitHubValid && isGiteaValid;
+    // Any one source is enough — a GitLab-only setup is a valid configuration.
+    return isAnySourceValid() && isGiteaValid;
   };
 
   const isGitHubConfigValid = (): boolean => {
     const { githubConfig } = config;
     return !!(githubConfig.username.trim() && githubConfig.token.trim());
   };
+
+  const isGitLabConfigValid = (): boolean => {
+    const { gitlabConfig } = config;
+    return !!(gitlabConfig?.token?.trim() && gitlabConfig?.url?.trim());
+  };
+
+  const isAnySourceValid = (): boolean =>
+    isGitHubConfigValid() || isGitLabConfigValid();
 
   // Removed the problematic useEffect that was causing circular dependencies
   // The lastRun and nextRun should be managed by the backend and fetched via API
@@ -194,6 +206,7 @@ export function ConfigTabs() {
       const reqPayload: SaveConfigApiRequest = {
         userId: user.id!,
         githubConfig: config.githubConfig,
+        gitlabConfig: config.gitlabConfig,
         giteaConfig: config.giteaConfig,
         scheduleConfig: scheduleConfig,
         cleanupConfig: config.cleanupConfig,
@@ -242,7 +255,7 @@ export function ConfigTabs() {
         setIsAutoSavingSchedule(false);
       }
     }, 500); // 500ms debounce
-  }, [user?.id, config.githubConfig, config.giteaConfig, config.cleanupConfig]);
+  }, [user?.id, config.gitlabConfig, config.githubConfig, config.giteaConfig, config.cleanupConfig]);
 
   // Auto-save function specifically for cleanup config changes
   const autoSaveCleanupConfig = useCallback(async (cleanupConfig: DatabaseCleanupConfig) => {
@@ -260,6 +273,7 @@ export function ConfigTabs() {
       const reqPayload: SaveConfigApiRequest = {
         userId: user.id!,
         githubConfig: config.githubConfig,
+        gitlabConfig: config.gitlabConfig,
         giteaConfig: config.giteaConfig,
         scheduleConfig: config.scheduleConfig,
         cleanupConfig: cleanupConfig,
@@ -307,7 +321,7 @@ export function ConfigTabs() {
         setIsAutoSavingCleanup(false);
       }
     }, 500); // 500ms debounce
-  }, [user?.id, config.githubConfig, config.giteaConfig, config.scheduleConfig]);
+  }, [user?.id, config.gitlabConfig, config.githubConfig, config.giteaConfig, config.scheduleConfig]);
 
   // Auto-save function specifically for GitHub config changes
   const autoSaveGitHubConfig = useCallback(async (githubConfig: GitHubConfig) => {
@@ -325,6 +339,7 @@ export function ConfigTabs() {
       const reqPayload: SaveConfigApiRequest = {
         userId: user.id!,
         githubConfig: githubConfig,
+        gitlabConfig: config.gitlabConfig,
         giteaConfig: config.giteaConfig,
         scheduleConfig: config.scheduleConfig,
         cleanupConfig: config.cleanupConfig,
@@ -356,7 +371,90 @@ export function ConfigTabs() {
         setIsAutoSavingGitHub(false);
       }
     }, 500); // 500ms debounce
-  }, [user?.id, config.giteaConfig, config.scheduleConfig, config.cleanupConfig]);
+  }, [user?.id, config.gitlabConfig, config.giteaConfig, config.scheduleConfig, config.cleanupConfig]);
+
+  // Auto-save function specifically for GitLab config changes
+  const autoSaveGitLabConfig = useCallback(async (gitlabConfig: GitLabConfig) => {
+    if (!user?.id) return;
+
+    if (autoSaveGitLabTimeoutRef.current) {
+      clearTimeout(autoSaveGitLabTimeoutRef.current);
+    }
+
+    autoSaveGitLabTimeoutRef.current = setTimeout(async () => {
+      setIsAutoSavingGitLab(true);
+
+      const reqPayload: SaveConfigApiRequest = {
+        userId: user.id!,
+        githubConfig: config.githubConfig,
+        gitlabConfig: gitlabConfig,
+        giteaConfig: config.giteaConfig,
+        scheduleConfig: config.scheduleConfig,
+        cleanupConfig: config.cleanupConfig,
+        mirrorOptions: config.mirrorOptions,
+        advancedOptions: config.advancedOptions,
+      };
+
+      try {
+        const response = await fetch(CONFIG_API_PATH, {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify(reqPayload),
+        });
+        const result: SaveConfigApiResponse = await response.json();
+
+        if (result.success) {
+          invalidateConfigCache();
+        } else {
+          showErrorToast(
+            `Auto-save failed: ${result.message || 'Unknown error'}`,
+            toast
+          );
+        }
+      } catch (error) {
+        showErrorToast(error, toast);
+      } finally {
+        setIsAutoSavingGitLab(false);
+      }
+    }, 500); // 500ms debounce
+  }, [user?.id, config.gitlabConfig, config.githubConfig, config.giteaConfig, config.scheduleConfig, config.cleanupConfig]);
+
+  /**
+   * Removes the stored GitLab source by sending an explicit null, which the
+   * config API distinguishes from an absent key (keep) — see
+   * resolveGitlabConfigIntent. Not debounced: this is a deliberate action and
+   * the user needs to know immediately whether it took effect.
+   */
+  const disconnectGitLab = useCallback(async () => {
+    if (!user?.id) return;
+
+    if (autoSaveGitLabTimeoutRef.current) {
+      clearTimeout(autoSaveGitLabTimeoutRef.current);
+    }
+
+    const reqPayload: SaveConfigApiRequest = {
+      userId: user.id,
+      githubConfig: config.githubConfig,
+      gitlabConfig: null,
+      giteaConfig: config.giteaConfig,
+      scheduleConfig: config.scheduleConfig,
+      cleanupConfig: config.cleanupConfig,
+      mirrorOptions: config.mirrorOptions,
+      advancedOptions: config.advancedOptions,
+    };
+
+    const response = await fetch(CONFIG_API_PATH, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify(reqPayload),
+    });
+    const result: SaveConfigApiResponse = await response.json();
+    if (!result.success) {
+      throw new Error(result.message || 'Failed to remove the GitLab connection');
+    }
+    setConfig(prev => ({ ...prev, gitlabConfig: DEFAULT_GITLAB_CONFIG }));
+    invalidateConfigCache();
+  }, [user?.id, config.gitlabConfig, config.githubConfig, config.giteaConfig, config.scheduleConfig, config.cleanupConfig, config.mirrorOptions, config.advancedOptions]);
 
   // Auto-save function specifically for Gitea config changes
   const autoSaveGiteaConfig = useCallback(async (giteaConfig: GiteaConfig) => {
@@ -374,6 +472,7 @@ export function ConfigTabs() {
       const reqPayload: SaveConfigApiRequest = {
         userId: user.id!,
         githubConfig: config.githubConfig,
+        gitlabConfig: config.gitlabConfig,
         giteaConfig: giteaConfig,
         scheduleConfig: config.scheduleConfig,
         cleanupConfig: config.cleanupConfig,
@@ -405,7 +504,7 @@ export function ConfigTabs() {
         setIsAutoSavingGitea(false);
       }
     }, 500); // 500ms debounce
-  }, [user?.id, config.githubConfig, config.scheduleConfig, config.cleanupConfig]);
+  }, [user?.id, config.gitlabConfig, config.githubConfig, config.scheduleConfig, config.cleanupConfig]);
 
   // Auto-save function for mirror options (handled within GitHub config)
   const autoSaveMirrorOptions = useCallback(async (mirrorOptions: MirrorOptions) => {
@@ -414,6 +513,7 @@ export function ConfigTabs() {
     const reqPayload: SaveConfigApiRequest = {
       userId: user.id!,
       githubConfig: config.githubConfig,
+      gitlabConfig: config.gitlabConfig,
       giteaConfig: config.giteaConfig,
       scheduleConfig: config.scheduleConfig,
       cleanupConfig: config.cleanupConfig,
@@ -440,7 +540,7 @@ export function ConfigTabs() {
     } catch (error) {
       showErrorToast(error, toast);
     }
-  }, [user?.id, config.githubConfig, config.giteaConfig, config.scheduleConfig, config.cleanupConfig, config.advancedOptions]);
+  }, [user?.id, config.gitlabConfig, config.githubConfig, config.giteaConfig, config.scheduleConfig, config.cleanupConfig, config.advancedOptions]);
 
   // Auto-save function for advanced options (handled within GitHub config)
   const autoSaveAdvancedOptions = useCallback(async (advancedOptions: AdvancedOptions) => {
@@ -449,6 +549,7 @@ export function ConfigTabs() {
     const reqPayload: SaveConfigApiRequest = {
       userId: user.id!,
       githubConfig: config.githubConfig,
+      gitlabConfig: config.gitlabConfig,
       giteaConfig: config.giteaConfig,
       scheduleConfig: config.scheduleConfig,
       cleanupConfig: config.cleanupConfig,
@@ -475,7 +576,7 @@ export function ConfigTabs() {
     } catch (error) {
       showErrorToast(error, toast);
     }
-  }, [user?.id, config.githubConfig, config.giteaConfig, config.scheduleConfig, config.cleanupConfig, config.mirrorOptions]);
+  }, [user?.id, config.gitlabConfig, config.githubConfig, config.giteaConfig, config.scheduleConfig, config.cleanupConfig, config.mirrorOptions]);
 
   // Auto-save function for notification config changes
   const autoSaveNotificationConfig = useCallback(async (notifConfig: NotificationConfig) => {
@@ -493,6 +594,7 @@ export function ConfigTabs() {
       const reqPayload = {
         userId: user.id!,
         githubConfig: config.githubConfig,
+        gitlabConfig: config.gitlabConfig,
         giteaConfig: config.giteaConfig,
         scheduleConfig: config.scheduleConfig,
         cleanupConfig: config.cleanupConfig,
@@ -524,7 +626,7 @@ export function ConfigTabs() {
         setIsAutoSavingNotification(false);
       }
     }, 500); // 500ms debounce
-  }, [user?.id, config.githubConfig, config.giteaConfig, config.scheduleConfig, config.cleanupConfig, config.mirrorOptions, config.advancedOptions]);
+  }, [user?.id, config.gitlabConfig, config.githubConfig, config.giteaConfig, config.scheduleConfig, config.cleanupConfig, config.mirrorOptions, config.advancedOptions]);
 
   // Cleanup timeouts on unmount
   useEffect(() => {
@@ -561,6 +663,10 @@ export function ConfigTabs() {
           setConfig({
             githubConfig:
               response.githubConfig || config.githubConfig,
+            // Null means GitLab was never configured; show the empty card.
+            gitlabConfig: response.gitlabConfig
+              ? { ...DEFAULT_GITLAB_CONFIG, ...response.gitlabConfig }
+              : DEFAULT_GITLAB_CONFIG,
             giteaConfig:
               response.giteaConfig || config.giteaConfig,
             scheduleConfig:
@@ -672,32 +778,32 @@ export function ConfigTabs() {
             Configuration
           </h1>
           <p className="text-sm text-muted-foreground">
-            Configure your GitHub and Gitea connections, and set up automatic
+            Configure your source connections and Gitea, and set up automatic
             mirroring.
           </p>
         </div>
         <div className="flex gap-x-4 w-full md:w-auto">
           <Button
             onClick={handleImportGitHubData}
-            disabled={isSyncing || !isGitHubConfigValid()}
+            disabled={isSyncing || !isAnySourceValid()}
             title={
-              !isGitHubConfigValid()
-                ? 'Please fill GitHub username and token fields'
+              !isAnySourceValid()
+                ? 'Configure a GitHub or GitLab source first'
                 : isSyncing
                 ? 'Import in progress'
-                : 'Import GitHub Data'
+                : 'Import repositories from every configured source'
             }
             className="w-full bg-indigo-500 text-white hover:bg-indigo-600 disabled:bg-muted disabled:text-muted-foreground md:w-auto"
           >
             {isSyncing ? (
               <>
                 <RefreshCw className="h-4 w-4 animate-spin mr-1" />
-                Import GitHub Data
+                Importing…
               </>
             ) : (
               <>
                 <RefreshCw className="h-4 w-4 mr-1" />
-                Import GitHub Data
+                Import Repositories
               </>
             )}
           </Button>
@@ -778,6 +884,23 @@ export function ConfigTabs() {
                 <div className="grid grid-cols-1 gap-6 md:grid-cols-2">
                   <GitHubConfigForm {...githubFormProps} part="connection" />
                   <GiteaConfigForm {...giteaFormProps} part="connection" />
+                </div>
+                <div className="grid grid-cols-1 gap-6">
+                  <GitLabConfigForm
+                    config={config.gitlabConfig}
+                    setConfig={(update) =>
+                      setConfig(prev => ({
+                        ...prev,
+                        gitlabConfig:
+                          typeof update === 'function'
+                            ? update(prev.gitlabConfig)
+                            : update,
+                      }))
+                    }
+                    onAutoSave={autoSaveGitLabConfig}
+                    onDisconnect={disconnectGitLab}
+                    isAutoSaving={isAutoSavingGitLab}
+                  />
                 </div>
                 <div className="grid grid-cols-1 gap-6 md:grid-cols-2 md:items-start">
                   <GitHubConfigForm {...githubFormProps} part="settings" />

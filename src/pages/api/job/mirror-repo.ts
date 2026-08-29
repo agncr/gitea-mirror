@@ -13,6 +13,9 @@ import { getDecryptedGitHubToken } from "@/lib/utils/config-encryption";
 import { processWithResilience } from "@/lib/utils/concurrency";
 import { createSecureErrorResponse } from "@/lib/utils";
 import { requireAuthenticatedUserId } from "@/lib/auth-guards";
+import { configuredSourceProviders } from "@/lib/utils/config-encryption";
+import { missingProviderCredentials } from "@/lib/utils/source-credentials";
+const hasAnySourceToken = (config: any) => configuredSourceProviders(config).length > 0;
 
 export const POST: APIRoute = async ({ request, locals }) => {
   try {
@@ -54,7 +57,7 @@ export const POST: APIRoute = async ({ request, locals }) => {
 
     const config = configResult[0];
 
-    if (!config || !config.githubConfig.token) {
+    if (!config || !hasAnySourceToken(config)) {
       return new Response(
         JSON.stringify({ error: "Config missing for the user or token." }),
         { status: 400, headers: { "Content-Type": "application/json" } }
@@ -79,16 +82,41 @@ export const POST: APIRoute = async ({ request, locals }) => {
       );
     }
 
+    // Validate credentials for the providers actually present in this batch.
+    // Checking only "some source is configured" would accept a repository whose
+    // forge has no token and fail later inside the async job, after the caller
+    // was already told the work had started.
+    const missingProviders = missingProviderCredentials(
+      repos,
+      configuredSourceProviders(config as any)
+    );
+    if (missingProviders.length > 0) {
+      return new Response(
+        JSON.stringify({
+          error: `Missing credentials for: ${missingProviders.join(", ")}`,
+        }),
+        { status: 400, headers: { "Content-Type": "application/json" } }
+      );
+    }
+
     // Start async mirroring in background with parallel processing and resilience
     setTimeout(async () => {
-      if (!config.githubConfig.token) {
-        throw new Error("GitHub token is missing.");
-      }
-
-      // Create a single Octokit instance to be reused with rate limit tracking
-      const decryptedToken = getDecryptedGitHubToken(config);
-      const githubUsername = config.githubConfig?.owner || undefined;
-      const octokit = createGitHubClient(decryptedToken, userId, githubUsername);
+      // Built once and only if a GitHub repository is actually in the batch:
+      // a GitLab-only setup has no GitHub token, and GitLab repos mirror code
+      // through Gitea's migration without a source API client.
+      let octokit: ReturnType<typeof createGitHubClient> | null = null;
+      const ensureOctokit = () => {
+        if (octokit) return octokit;
+        if (!config.githubConfig?.token) {
+          throw new Error("GitHub token is missing.");
+        }
+        octokit = createGitHubClient(
+          getDecryptedGitHubToken(config),
+          userId,
+          config.githubConfig?.owner || undefined,
+        );
+        return octokit;
+      };
 
       // Define the concurrency limit - adjust based on API rate limits
       const CONCURRENCY_LIMIT = 3;
@@ -129,16 +157,19 @@ export const POST: APIRoute = async ({ request, locals }) => {
             owner !== config.giteaConfig?.defaultOwner || // Different owner means org
             mirrorStrategy === "single-org"; // Single-org strategy always uses org
 
+          const repoOctokit =
+            repoData.provider === "gitlab" ? null : ensureOctokit();
+
           if (shouldUseOrgMirror) {
             await mirrorGitHubOrgRepoToGiteaOrg({
               config,
-              octokit,
+              octokit: repoOctokit,
               orgName: owner,
               repository: repoData,
             });
           } else {
             await mirrorGithubRepoToGitea({
-              octokit,
+              octokit: repoOctokit,
               repository: repoData,
               config,
             });
