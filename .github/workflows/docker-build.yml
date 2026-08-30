@@ -27,6 +27,11 @@ on:
       - 'src/**'
   schedule:
     - cron: '0 0 * * 0'  # Weekly security scan on Sunday at midnight
+  # Manual trigger. Needed on forks in particular: GitHub puts any workflow
+  # with a `schedule` trigger into the `disabled_fork` state, and once it is
+  # re-enabled there is otherwise nothing to start it until the next push
+  # touches one of the paths above.
+  workflow_dispatch:
 
 env:
   REGISTRY: ghcr.io
